@@ -126,7 +126,15 @@ class ChatterboxTTS:
         self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
+    def from_local(cls, ckpt_dir, device, use_compile=False) -> 'ChatterboxTTS':
+        """
+        Load ChatterboxTTS from a local checkpoint directory.
+        
+        Args:
+            ckpt_dir: Path to checkpoint directory
+            device: Target device ('cpu', 'cuda', 'mps')
+            use_compile: Whether to apply torch.compile() optimization (can provide 1.2-1.5x speedup)
+        """
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -141,12 +149,23 @@ class ChatterboxTTS:
         )
         ve.to(device).eval()
 
-        t3 = T3()
+        # Initialize T3 with device-aware optimizations
+        # This will use SDPA attention (faster) for English-only models,
+        # and set optimal dtype (float16 for MPS, bfloat16 for CUDA)
+        t3 = T3(device=device)
         t3_state = load_file(ckpt_dir / "t3_cfg.safetensors")
         if "model" in t3_state.keys():
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
+        
+        # Print optimization info
+        print(f"  T3 attention: {t3.cfg._attn_implementation}, dtype: {t3.cfg.torch_dtype}")
+        
+        # Optionally apply torch.compile for additional speedup
+        if use_compile:
+            t3.compile_for_device(device)
+            print(f"  torch.compile applied")
 
         s3gen = S3Gen()
         s3gen.load_state_dict(
@@ -165,7 +184,14 @@ class ChatterboxTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTTS':
+    def from_pretrained(cls, device, use_compile=False) -> 'ChatterboxTTS':
+        """
+        Load ChatterboxTTS from HuggingFace Hub.
+        
+        Args:
+            device: Target device ('cpu', 'cuda', 'mps')
+            use_compile: Whether to apply torch.compile() optimization (can provide 1.2-1.5x speedup)
+        """
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -177,7 +203,7 @@ class ChatterboxTTS:
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
 
-        return cls.from_local(Path(local_path).parent, device)
+        return cls.from_local(Path(local_path).parent, device, use_compile=use_compile)
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav

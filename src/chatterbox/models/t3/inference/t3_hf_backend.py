@@ -87,10 +87,20 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         S should be 1.
         """
         is_large_input = inputs_embeds.size(1) != 1
-        has_cache = past_key_values is not None and len(past_key_values) > 0
-        assert not (is_large_input and has_cache)
+        # Check if cache is populated (not just existing)
+        # For StaticCache, len() returns num_layers, not seq_length
+        # Use get_seq_length() if available to check if cache has content
+        if past_key_values is not None:
+            if hasattr(past_key_values, 'get_seq_length'):
+                # StaticCache or similar - check actual sequence length
+                has_cache = past_key_values.get_seq_length() > 0
+            else:
+                # Legacy tuple-based cache
+                has_cache = len(past_key_values) > 0
+        else:
+            has_cache = False
+        assert not (is_large_input and has_cache), "Cannot pass large input with populated cache"
         assert return_dict
-        assert output_hidden_states
 
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,
@@ -100,7 +110,13 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=True,
         )
-        hidden_states = tfmr_out.hidden_states[-1]  # (B, seq, dim)
+        
+        # Get hidden states for logit projection
+        # During generation with cache, we can use last_hidden_state directly (more memory efficient)
+        if output_hidden_states and tfmr_out.hidden_states is not None:
+            hidden_states = tfmr_out.hidden_states[-1]  # (B, seq, dim)
+        else:
+            hidden_states = tfmr_out.last_hidden_state  # (B, seq, dim)
 
         logits = self.speech_head(hidden_states)
         # assert inputs_embeds.size(0) == 1 # (disabled for CFG)
@@ -111,6 +127,6 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         return CausalLMOutputWithCrossAttentions(
             logits=logits,
             past_key_values=tfmr_out.past_key_values,
-            hidden_states=tfmr_out.hidden_states,
+            hidden_states=tfmr_out.hidden_states if output_hidden_states else None,
             attentions=tfmr_out.attentions,
         )

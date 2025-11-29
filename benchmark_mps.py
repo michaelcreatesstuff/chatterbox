@@ -258,17 +258,23 @@ class ChatterboxBenchmark:
         mem_before = get_memory_mb()
         load_start = time.time()
         
+        # Disable torch.compile for now - it causes recompilation issues with dynamic KV cache sizes
+        # The SDPA + float16 optimizations still provide significant speedup
+        use_compile = False
+        
         if self.config.model_type == "multilingual":
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
             self.model = ChatterboxMultilingualTTS.from_pretrained(device=device)
         else:
             from chatterbox.tts import ChatterboxTTS
-            self.model = ChatterboxTTS.from_pretrained(device=device)
+            self.model = ChatterboxTTS.from_pretrained(device=device, use_compile=use_compile)
         
         load_time = time.time() - load_start
         mem_after = get_memory_mb()
         
         print(f"✓ Model loaded in {load_time:.2f}s")
+        if use_compile:
+            print(f"  torch.compile enabled for MPS optimization")
         print(f"  Memory: {mem_before:.1f} → {mem_after:.1f} MB (+{mem_after - mem_before:.1f} MB)")
         
         # Prepare conditionals if audio prompt provided
