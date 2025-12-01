@@ -6,9 +6,11 @@ T3 MLX Backend for generation.
 MLX equivalent of T3HuggingfaceBackend from PyTorch version.
 """
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Set, Tuple
 import mlx.core as mx
 import mlx.nn as nn
+
+from .alignment_stream_analyzer_mlx import LLAMA_ALIGNED_HEADS
 
 
 class T3MLXBackend(nn.Module):
@@ -45,6 +47,9 @@ class T3MLXBackend(nn.Module):
         self.config = config
         self.alignment_stream_analyzer = alignment_stream_analyzer
         self._added_cond = False
+        
+        # Pre-compute the set of layer indices for attention output
+        self._attention_layer_indices: Set[int] = {layer_idx for layer_idx, _ in LLAMA_ALIGNED_HEADS}
 
     def reset_state(self):
         """Reset generation state for new sequence."""
@@ -73,7 +78,7 @@ class T3MLXBackend(nn.Module):
             output_hidden_states: Whether to output hidden states
 
         Returns:
-            Dictionary with 'logits', 'cache', 'hidden_states', etc.
+            Dictionary with 'logits', 'cache', 'hidden_states', 'attentions', etc.
         """
         # Prepend decoder conditioning on first step
         if decoder_cond is not None and not self._added_cond:
@@ -87,11 +92,15 @@ class T3MLXBackend(nn.Module):
             self._added_cond = True
 
         # Forward through Llama model
+        # When alignment_stream_analyzer is active, we need attention from specific layers
+        need_attentions = output_attentions or self.alignment_stream_analyzer is not None
+        
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,
             cache=cache if use_cache else None,
             output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
+            output_attentions=need_attentions,
+            output_attentions_layers=self._attention_layer_indices if need_attentions else None,
         )
 
         # Get final hidden states for logits projection
@@ -100,6 +109,9 @@ class T3MLXBackend(nn.Module):
 
         # Project to speech logits
         logits = self.speech_head(hidden_states)
+        
+        # Extract attention weights for aligned heads if available
+        attentions = tfmr_out.get('attentions')
 
         return {
             'logits': logits,
@@ -107,6 +119,7 @@ class T3MLXBackend(nn.Module):
             # Only include hidden_states if requested (saves memory during generation)
             'hidden_states': tfmr_out.get('hidden_states') if output_hidden_states else None,
             'last_hidden_state': hidden_states,
+            'attentions': attentions,
         }
 
     def prepare_inputs_for_generation(

@@ -294,7 +294,15 @@ def crossfade_chunks(
         return torch.from_numpy(result)
     
     # Optimized approach for many chunks: pre-allocate and batch process
-    total_length = sum(len(c) for c in processed) - overlap_samples * (len(processed) - 1)
+    # Calculate total length accounting for chunks that may be shorter than overlap
+    total_length = len(processed[0])
+    for chunk in processed[1:]:
+        if len(chunk) > overlap_samples:
+            total_length += len(chunk) - overlap_samples
+        else:
+            # Short chunk: no overlap, just concatenate
+            total_length += len(chunk)
+    
     result = np.zeros(total_length, dtype=np.float32)
     
     # Pre-compute fade curves once
@@ -305,21 +313,27 @@ def crossfade_chunks(
     current_pos = 0
     first_chunk = processed[0]
     result[:len(first_chunk)] = first_chunk
-    current_pos = len(first_chunk) - overlap_samples
+    current_pos = len(first_chunk)
     
     # Process remaining chunks with crossfade
     for chunk in processed[1:]:
-        if overlap_samples > 0 and len(chunk) > overlap_samples:
+        if overlap_samples > 0 and len(chunk) > overlap_samples and current_pos >= overlap_samples:
             # Apply crossfade in-place
-            result[current_pos:current_pos + overlap_samples] *= fade_out
-            result[current_pos:current_pos + overlap_samples] += chunk[:overlap_samples] * fade_in
-            rest_start = current_pos + overlap_samples
+            crossfade_start = current_pos - overlap_samples
+            result[crossfade_start:current_pos] *= fade_out
+            result[crossfade_start:current_pos] += chunk[:overlap_samples] * fade_in
+            # Add the rest of the chunk
             rest_length = len(chunk) - overlap_samples
-            result[rest_start:rest_start + rest_length] = chunk[overlap_samples:]
-            current_pos = rest_start + rest_length - overlap_samples
+            result[current_pos:current_pos + rest_length] = chunk[overlap_samples:]
+            current_pos += rest_length
         else:
-            result[current_pos:current_pos + len(chunk)] = chunk
-            current_pos += len(chunk)
+            # Short chunk or no overlap possible: just concatenate
+            chunk_len = len(chunk)
+            result[current_pos:current_pos + chunk_len] = chunk
+            current_pos += chunk_len
+    
+    # Trim to actual length used (in case of calculation mismatch)
+    result = result[:current_pos]
     
     return torch.from_numpy(result)
 

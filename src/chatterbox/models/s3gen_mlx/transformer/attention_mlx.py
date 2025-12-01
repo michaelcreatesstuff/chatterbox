@@ -137,7 +137,7 @@ class MultiHeadedAttentionMLX(nn.Module):
         pos_emb: Optional[mx.array] = None,
         cache: Optional[mx.array] = None,
     ) -> Tuple[mx.array, mx.array]:
-        """Compute scaled dot product attention.
+        """Compute scaled dot product attention using mx.fast.scaled_dot_product_attention.
 
         Args:
             query: Query tensor (batch, time1, size).
@@ -165,12 +165,27 @@ class MultiHeadedAttentionMLX(nn.Module):
         # New cache
         new_cache = mx.concatenate([k, v], axis=-1)
 
-        # Compute attention scores
+        # Use mx.fast.scaled_dot_product_attention for optimized attention
         scale = 1.0 / math.sqrt(self.d_k)
-        scores = (q @ mx.transpose(k, (0, 1, 3, 2))) * scale
-
-        output = self.forward_attention(v, scores, mask)
-        return output, new_cache
+        
+        # Prepare mask for mx.fast.scaled_dot_product_attention
+        attn_mask = None
+        if mask is not None and mask.shape[-1] > 0:
+            # Expand mask for heads: (batch, 1, time2) -> (batch, 1, 1, time2)
+            attn_mask = mx.expand_dims(mask, axis=1)
+            # Adjust mask size if needed
+            if attn_mask.shape[-1] > k.shape[2]:
+                attn_mask = attn_mask[..., :k.shape[2]]
+            # Convert boolean mask to attention bias
+            # True (valid) -> 0, False (masked) -> -inf
+            attn_mask = mx.where(attn_mask, mx.array(0.0), mx.array(float('-inf')))
+        
+        # Use optimized attention kernel
+        x = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=attn_mask)
+        
+        # Reshape and project
+        x = self._reshape_from_heads(x)
+        return self.linear_out(x), new_cache
 
 
 class RelPositionMultiHeadedAttentionMLX(MultiHeadedAttentionMLX):

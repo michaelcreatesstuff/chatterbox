@@ -66,6 +66,9 @@ class FeedForwardMLX(nn.Module):
 class AttentionMLX(nn.Module):
     """Self-attention layer for MLX.
     
+    Optimized using mx.fast.scaled_dot_product_attention for
+    better kernel fusion and memory efficiency.
+    
     Args:
         query_dim: Query dimension.
         heads: Number of attention heads.
@@ -98,11 +101,11 @@ class AttentionMLX(nn.Module):
         hidden_states: mx.array,
         attention_mask: Optional[mx.array] = None,
     ) -> mx.array:
-        """Forward pass.
+        """Forward pass using mx.fast.scaled_dot_product_attention.
         
         Args:
             hidden_states: Input (batch, seq, dim).
-            attention_mask: Attention mask.
+            attention_mask: Attention mask (additive bias form or boolean).
             
         Returns:
             Output (batch, seq, dim).
@@ -114,34 +117,36 @@ class AttentionMLX(nn.Module):
         k = self.to_k(hidden_states)
         v = self.to_v(hidden_states)
         
-        # Reshape for multi-head attention
+        # Reshape for multi-head attention: (batch, seq, heads, dim_head)
         q = mx.reshape(q, (batch, seq_len, self.heads, self.dim_head))
         k = mx.reshape(k, (batch, seq_len, self.heads, self.dim_head))
         v = mx.reshape(v, (batch, seq_len, self.heads, self.dim_head))
         
-        # Transpose to (batch, heads, seq, dim_head)
+        # Transpose to (batch, heads, seq, dim_head) for attention
         q = mx.transpose(q, (0, 2, 1, 3))
         k = mx.transpose(k, (0, 2, 1, 3))
         v = mx.transpose(v, (0, 2, 1, 3))
         
-        # Compute attention scores
-        scores = (q @ mx.transpose(k, (0, 1, 3, 2))) * self.scale
-        
-        # Apply attention mask (already in bias form)
+        # Use mx.fast.scaled_dot_product_attention for optimized attention
+        # This fuses softmax, matmul, and scaling into a single efficient kernel
         if attention_mask is not None:
-            # Ensure mask broadcasts correctly to [B, heads, T, T]
+            # mx.fast.scaled_dot_product_attention expects mask in shape (B, H, T_q, T_k) or broadcastable
             # If mask is [B, 1, T], expand to [B, 1, 1, T]
             if attention_mask.ndim == 3:
                 attention_mask = mx.expand_dims(attention_mask, axis=2)
-            scores = scores + attention_mask
+            # The mask should be additive (large negative for masked positions)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, 
+                scale=self.scale,
+                mask=attention_mask
+            )
+        else:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v,
+                scale=self.scale
+            )
         
-        # Softmax in FP32 for stability
-        attn = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-        
-        # Apply attention to values
-        out = attn @ v
-        
-        # Reshape back
+        # Reshape back: (batch, heads, seq, dim_head) -> (batch, seq, heads * dim_head)
         out = mx.transpose(out, (0, 2, 1, 3))
         out = mx.reshape(out, (batch, seq_len, -1))
         

@@ -26,6 +26,7 @@ class ConditionalCFMMLX(nn.Module):
     """Conditional Flow Matching decoder for MLX.
     
     Uses midpoint (2nd order) ODE solver for flow matching inference.
+    Optimized with @mx.compile for the ODE step function.
     """
     
     def __init__(
@@ -52,6 +53,9 @@ class ConditionalCFMMLX(nn.Module):
         self.training_cfg_rate = cfm_params.training_cfg_rate
         self.inference_cfg_rate = cfm_params.inference_cfg_rate
         self.estimator = estimator
+        
+        # Create compiled step function for better kernel fusion
+        self._compiled_step = None
 
     def __call__(
         self,
@@ -125,6 +129,7 @@ class ConditionalCFMMLX(nn.Module):
         """Midpoint (2nd order) ODE solver.
         
         Achieves same quality as Euler with fewer steps.
+        Uses compiled step function for better kernel fusion.
         
         Args:
             x: Initial noise.
@@ -140,14 +145,16 @@ class ConditionalCFMMLX(nn.Module):
         t = t_span[0]
         dt = t_span[1] - t_span[0]
         
-        # Pre-allocate CFG buffers (batch size 2 for conditional/unconditional)
-        mel_len = x.shape[2]
-        x_in = mx.zeros((2, 80, mel_len))
-        mask_in = mx.zeros((2, 1, mel_len))
-        mu_in = mx.zeros((2, 80, mel_len))
-        t_in = mx.zeros((2,))
-        spks_in = mx.zeros((2, 80)) if spks is not None else None
-        cond_in = mx.zeros((2, 80, mel_len)) if cond is not None else None
+        # Define the step function that can be compiled
+        # This applies CFG and returns the derivative
+        def _apply_cfg(k: mx.array, cfg_rate: float) -> mx.array:
+            """Apply classifier-free guidance."""
+            k_cond = k[:1]
+            k_uncond = k[1:]
+            return (1.0 + cfg_rate) * k_cond - cfg_rate * k_uncond
+        
+        # Compile the CFG application for faster execution
+        apply_cfg = mx.compile(_apply_cfg)
         
         for step in range(1, len(t_span)):
             # Half step: evaluate derivative at current position
@@ -156,17 +163,13 @@ class ConditionalCFMMLX(nn.Module):
             mu_in = mx.concatenate([mu, mx.zeros_like(mu)], axis=0)
             t_in = mx.broadcast_to(mx.expand_dims(t, axis=0), (2,))
             
-            if spks is not None:
-                spks_in = mx.concatenate([spks, mx.zeros_like(spks)], axis=0)
-            if cond is not None:
-                cond_in = mx.concatenate([cond, mx.zeros_like(cond)], axis=0)
+            spks_in = mx.concatenate([spks, mx.zeros_like(spks)], axis=0) if spks is not None else None
+            cond_in = mx.concatenate([cond, mx.zeros_like(cond)], axis=0) if cond is not None else None
             
             k1 = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
             
-            # Apply CFG to k1
-            k1_cond = k1[:1]
-            k1_uncond = k1[1:]
-            k1 = (1.0 + self.inference_cfg_rate) * k1_cond - self.inference_cfg_rate * k1_uncond
+            # Apply CFG to k1 using compiled function
+            k1 = apply_cfg(k1, self.inference_cfg_rate)
             
             # Compute midpoint
             x_mid = x + (dt / 2) * k1
@@ -178,10 +181,8 @@ class ConditionalCFMMLX(nn.Module):
             
             k2 = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
             
-            # Apply CFG to k2
-            k2_cond = k2[:1]
-            k2_uncond = k2[1:]
-            k2 = (1.0 + self.inference_cfg_rate) * k2_cond - self.inference_cfg_rate * k2_uncond
+            # Apply CFG to k2 using compiled function
+            k2 = apply_cfg(k2, self.inference_cfg_rate)
             
             # Update x using midpoint derivative
             x = x + dt * k2

@@ -18,6 +18,8 @@ from .modules.learned_pos_emb_mlx import LearnedPositionEmbeddingsMLX
 from .modules.cond_enc_mlx import T3CondEncMLX, T3CondMLX
 from .inference.t3_mlx_backend import T3MLXBackend
 from .inference.kv_cache_mlx import KVCacheMLX
+# NOTE: AlignmentStreamAnalyzerMLX is available but disabled due to attention extraction issues
+# from .inference.alignment_stream_analyzer_mlx import AlignmentStreamAnalyzerMLX, LLAMA_ALIGNED_HEADS
 from ..t3.llama_configs import LLAMA_CONFIGS
 from ..t3.modules.t3_config import T3Config
 from ..utils import get_memory_info, is_debug
@@ -377,12 +379,18 @@ class T3MLX(nn.Module):
 
         # Initialize backend if needed
         if self.patched_model is None:
+            # NOTE: Alignment analyzer is disabled for now because attention extraction
+            # in MLX isn't working correctly, causing premature EOS. The model will rely
+            # on natural EOS detection and max_new_tokens limits instead.
+            # TODO: Fix attention extraction in llama_mlx.py to enable this
+            alignment_analyzer = None
+            
             self.patched_model = T3MLXBackend(
                 llama_model=self.tfmr,
                 speech_emb=self.speech_emb,
                 speech_head=self.speech_head,
                 config=self.cfg,
-                alignment_stream_analyzer=None,  # TODO: implement for multilingual
+                alignment_stream_analyzer=alignment_analyzer,
             )
         else:
             self.patched_model.reset_state()
@@ -412,10 +420,14 @@ class T3MLX(nn.Module):
         # Import sampling utilities (to be implemented)
         from .inference.sampling_utils_mlx import apply_repetition_penalty, apply_top_p, apply_min_p
 
+        # Get alignment analyzer reference
+        alignment_analyzer = self.patched_model.alignment_stream_analyzer
+
         # Generation loop
         token_iterator = range(max_new_tokens)
         if show_progress:
             token_iterator = tqdm(token_iterator, desc="Generating", dynamic_ncols=True)
+        
         for i in token_iterator:
             logits_step = output['logits'][:, -1, :]  # (B, vocab)
             
@@ -447,6 +459,7 @@ class T3MLX(nn.Module):
             
             # int() implicitly evaluates, so we don't need explicit mx.eval here
             token_val = int(next_token[0, 0])
+            
             generated_ids.append(next_token)
 
             # Check for EOS

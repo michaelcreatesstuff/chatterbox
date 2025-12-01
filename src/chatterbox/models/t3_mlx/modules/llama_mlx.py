@@ -160,7 +160,8 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
-    ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
+        output_attentions: bool = False,
+    ) -> Tuple[mx.array, Tuple[mx.array, mx.array], Optional[mx.array]]:
         """
         Forward pass for attention.
 
@@ -168,9 +169,11 @@ class Attention(nn.Module):
             x: Input tensor of shape (B, L, D)
             mask: Optional attention mask
             cache: Optional (key, value) cache tuple
+            output_attentions: Whether to return attention weights
 
         Returns:
-            Tuple of (output, (new_k_cache, new_v_cache))
+            Tuple of (output, (new_k_cache, new_v_cache), attn_weights)
+            attn_weights is None if output_attentions=False
         """
         B, L, _ = x.shape
 
@@ -209,12 +212,26 @@ class Attention(nn.Module):
             k = mx.repeat(k, n_rep, axis=1)
             v = mx.repeat(v, n_rep, axis=1)
 
-        # Use mx.fast.scaled_dot_product_attention with causal masking
-        # This is faster and correctly applies causal attention like PT's eager attention
-        # mask="causal" applies the upper triangular -inf mask automatically
-        output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask="causal"
-        )
+        attn_weights = None
+        
+        if output_attentions:
+            # Manual attention to get weights
+            # q: (B, n_heads, L_q, head_dim), k: (B, n_heads, L_k, head_dim)
+            scores = (q @ mx.transpose(k, (0, 1, 3, 2))) * self.scale  # (B, n_heads, L_q, L_k)
+            
+            # Apply causal mask
+            L_q, L_k = q.shape[2], k.shape[2]
+            causal_mask = mx.triu(mx.full((L_q, L_k), -1e9), k=L_k - L_q + 1)
+            scores = scores + causal_mask
+            
+            attn_weights = mx.softmax(scores, axis=-1)  # (B, n_heads, L_q, L_k)
+            output = attn_weights @ v  # (B, n_heads, L_q, head_dim)
+        else:
+            # Use mx.fast.scaled_dot_product_attention with causal masking
+            # This is faster and correctly applies causal attention like PT's eager attention
+            output = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask="causal"
+            )
 
         # Reshape and project output
         output = mx.transpose(output, (0, 2, 1, 3))  # (B, L_q, n_heads, head_dim)
@@ -222,7 +239,7 @@ class Attention(nn.Module):
         output = self.o_proj(output)
 
         # Return output and updated cache (k, v are in transposed format: B, n_heads, L, head_dim)
-        return output, (k, v)
+        return output, (k, v), attn_weights
 
 
 class MLP(nn.Module):
@@ -254,7 +271,8 @@ class TransformerBlock(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
-    ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
+        output_attentions: bool = False,
+    ) -> Tuple[mx.array, Tuple[mx.array, mx.array], Optional[mx.array]]:
         """
         Forward pass for transformer block.
 
@@ -262,19 +280,25 @@ class TransformerBlock(nn.Module):
             x: Input tensor of shape (B, L, D)
             mask: Optional attention mask
             cache: Optional (key, value) cache
+            output_attentions: Whether to return attention weights
 
         Returns:
-            Tuple of (output, updated_cache)
+            Tuple of (output, updated_cache, attn_weights)
         """
         # Self-attention with residual
-        r, cache = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
+        r, cache, attn_weights = self.self_attn(
+            self.input_layernorm(x), 
+            mask=mask, 
+            cache=cache,
+            output_attentions=output_attentions
+        )
         h = x + r
 
         # Feed-forward with residual
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
 
-        return out, cache
+        return out, cache, attn_weights
 
 
 class LlamaModelMLX(nn.Module):
@@ -295,6 +319,7 @@ class LlamaModelMLX(nn.Module):
         mask: Optional[mx.array] = None,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
+        output_attentions_layers: Optional[set] = None,
     ) -> Dict:
         """
         Forward pass for Llama model.
@@ -304,10 +329,11 @@ class LlamaModelMLX(nn.Module):
             cache: Optional list of (key, value) caches for each layer
             mask: Optional attention mask
             output_hidden_states: Whether to return all hidden states
-            output_attentions: Whether to return attention weights (not implemented)
+            output_attentions: Whether to return attention weights
+            output_attentions_layers: Set of layer indices to get attention from (for efficiency)
 
         Returns:
-            Dictionary with 'hidden_states' and optionally 'cache'
+            Dictionary with 'hidden_states', 'cache', and optionally 'attentions'
         """
         h = inputs_embeds
 
@@ -317,14 +343,26 @@ class LlamaModelMLX(nn.Module):
 
         new_cache = []
         all_hidden_states = [] if output_hidden_states else None
+        all_attentions = {} if output_attentions else None
+
+        # Determine which layers need attention output
+        if output_attentions_layers is None:
+            output_attentions_layers = set(range(len(self.layers))) if output_attentions else set()
 
         # Pass through transformer layers
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states.append(h)
 
-            h, layer_cache = layer(h, mask=mask, cache=cache[i])
+            # Only compute attention weights for requested layers
+            need_attn = output_attentions and i in output_attentions_layers
+            h, layer_cache, attn_weights = layer(
+                h, mask=mask, cache=cache[i], output_attentions=need_attn
+            )
             new_cache.append(layer_cache)
+            
+            if need_attn and attn_weights is not None:
+                all_attentions[i] = attn_weights
 
         # Final layer norm
         h = self.norm(h)
@@ -332,8 +370,13 @@ class LlamaModelMLX(nn.Module):
         if output_hidden_states:
             all_hidden_states.append(h)
 
-        return {
+        result = {
             'hidden_states': all_hidden_states if output_hidden_states else [h],
             'cache': new_cache,
             'last_hidden_state': h,
         }
+        
+        if output_attentions:
+            result['attentions'] = all_attentions
+            
+        return result

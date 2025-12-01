@@ -151,10 +151,13 @@ class AlignmentStreamAnalyzer:
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
             
-        # Check for excessive token repetition (3x same token in a row)
+        # Check for excessive token repetition (2x same token in a row)
+        # Only trigger after we've generated at least 20 tokens (avoid false positives at start)
+        min_tokens_before_repetition_check = 20
         token_repetition = (
             # self.complete and 
             len(self.generated_tokens) >= 3 and
+            self.curr_frame_pos >= min_tokens_before_repetition_check and
             len(set(self.generated_tokens[-2:])) == 1
         )
         
