@@ -108,11 +108,22 @@ class T3(nn.Module):
             hp = T3Config.english_only()  # Default to English-only config for backward compatibility
         super().__init__()
         self.hp = hp
-        self.cfg = LlamaConfig(**LLAMA_CONFIGS[hp.llama_config_name])
-        # Set attention implementation to 'eager' to support output_attentions
-        # SDPA (default) doesn't support output_attentions needed for alignment analysis
-        self.cfg._attn_implementation = 'eager'
-        self.tfmr = LlamaModel(self.cfg)
+
+        # Support both Llama and GPT2 backbones
+        if hp.llama_config_name.startswith("GPT2"):
+            # GPT2 models for Turbo
+            from transformers import GPT2Model, GPT2Config
+            self.cfg = GPT2Config(**LLAMA_CONFIGS[hp.llama_config_name])
+            # GPT2 uses 'eager' attention by default
+            self.tfmr = GPT2Model(self.cfg)
+        else:
+            # Llama models (standard/multilingual)
+            self.cfg = LlamaConfig(**LLAMA_CONFIGS[hp.llama_config_name])
+            # Set attention implementation to 'eager' to support output_attentions
+            # SDPA (default) doesn't support output_attentions needed for alignment analysis
+            self.cfg._attn_implementation = 'eager'
+            self.tfmr = LlamaModel(self.cfg)
+
         self.dim = self.cfg.hidden_size
         self.deepspeed_patch_applied = False
 
@@ -121,13 +132,17 @@ class T3(nn.Module):
         self.text_emb = nn.Embedding(hp.text_tokens_dict_size, self.dim)
         self.speech_emb = nn.Embedding(hp.speech_tokens_dict_size, self.dim)
 
-        # custom position embedding
+        # Custom position embedding (not used for GPT2 - it has built-in learned PE)
         if hp.input_pos_emb == "learned":
             max_text_seq_len = hp.max_text_tokens + 2
             self.text_pos_emb = LearnedPositionEmbeddings(max_text_seq_len, self.dim)
 
             max_mel_seq_len = hp.max_speech_tokens + 2 + 2
             self.speech_pos_emb = LearnedPositionEmbeddings(max_mel_seq_len, self.dim)
+        elif hp.input_pos_emb is None:
+            # GPT2/Turbo: No custom position embeddings (uses GPT2's built-in)
+            self.text_pos_emb = None
+            self.speech_pos_emb = None
 
         # logit projection
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
@@ -143,8 +158,11 @@ class T3(nn.Module):
         Token cond data needs to be embedded, so that needs to be here instead of in `T3CondEnc`.
         """
         if t3_cond.cond_prompt_speech_tokens is not None and t3_cond.cond_prompt_speech_emb is None:
-            t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens) + \
-                self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+            cond_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens)
+            # Only add position embeddings if available (not for GPT2/Turbo)
+            if self.speech_pos_emb is not None:
+                cond_speech_emb = cond_speech_emb + self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+            t3_cond.cond_prompt_speech_emb = cond_speech_emb
         return self.cond_enc(t3_cond)  # (B, len_cond, dim)
 
     def prepare_input_embeds(
@@ -529,5 +547,122 @@ class T3(nn.Module):
         
         # Force memory cleanup
         clear_device_memory()
-        
+
         return predicted_tokens
+
+    @torch.inference_mode()
+    def inference_turbo(
+        self,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        max_gen_len: int = 1000,
+    ) -> Tensor:
+        """
+        Turbo inference without CFG (classifier-free guidance).
+        Optimized for Chatterbox-Turbo model with GPT2 backbone.
+
+        Simpler and faster than standard inference() method:
+        - No CFG (no dual forward pass)
+        - Direct GPT2 text tokens (no BOT/EOT markers required)
+        - Uses standard transformers logits processors
+
+        Args:
+            t3_cond: T3 conditioning (speaker embedding, etc.)
+            text_tokens: Input text tokens from GPT2 tokenizer [B, T_text]
+            temperature: Sampling temperature (higher = more random)
+            top_k: Top-k sampling threshold
+            top_p: Nucleus sampling threshold
+            repetition_penalty: Penalty for repeating tokens (>1 = less repetition)
+            max_gen_len: Maximum speech tokens to generate
+
+        Returns:
+            Generated speech tokens [T_speech] (1D tensor)
+        """
+        from transformers.generation.logits_process import (
+            LogitsProcessorList,
+            TopPLogitsWarper,
+            TopKLogitsWarper,
+            TemperatureLogitsWarper,
+            RepetitionPenaltyLogitsProcessor,
+        )
+
+        logits_processors = LogitsProcessorList()
+        if temperature > 0 and temperature != 1.0:
+            logits_processors.append(TemperatureLogitsWarper(temperature))
+        if top_k > 0:
+            logits_processors.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
+        if top_p < 1.0:
+            logits_processors.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
+        if repetition_penalty != 1.0:
+            logits_processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+
+        speech_start_token = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+        embeds, _ = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=speech_start_token,
+            cfg_weight=0.0,
+        )
+
+        past_key_values = None
+
+        # First forward pass
+        output = self.tfmr(
+            inputs_embeds=embeds,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = output.past_key_values
+
+        # GPT2 returns last_hidden_state, need to project through speech_head for logits
+        hidden_states = output.last_hidden_state
+        logits = self.speech_head(hidden_states[:, -1:, :]).squeeze(1)  # [B, vocab_size]
+
+        all_tokens = speech_start_token.clone()
+        processed_logits = logits_processors(all_tokens, logits)
+        probs = F.softmax(processed_logits, dim=-1)
+        next_speech_token = torch.multinomial(probs, num_samples=1)
+
+        all_tokens = torch.cat([all_tokens, next_speech_token], dim=1)
+        current_speech_token = next_speech_token
+
+        # Generation loop
+        for _ in range(max_gen_len - 1):
+            # Get speech embedding for current token
+            speech_embed = self.speech_emb(current_speech_token)
+
+            output = self.tfmr(
+                inputs_embeds=speech_embed,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = output.past_key_values
+
+            # Project through speech_head for logits
+            hidden_states = output.last_hidden_state
+            logits = self.speech_head(hidden_states[:, -1:, :]).squeeze(1)  # [B, vocab_size]
+
+            processed_logits = logits_processors(all_tokens, logits)
+            if torch.all(processed_logits == -float("inf")):
+                print("Warning: All logits are -inf")
+                break
+
+            probs = F.softmax(processed_logits, dim=-1)
+            next_speech_token = torch.multinomial(probs, num_samples=1)
+
+            if next_speech_token.item() == self.hp.stop_speech_token:
+                break
+
+            all_tokens = torch.cat([all_tokens, next_speech_token], dim=1)
+            current_speech_token = next_speech_token
+
+        # Remove start token from output (first token is BOS)
+        result = all_tokens[:, 1:]  # [B, T_speech]
+        return result[0]  # Return 1D tensor
+

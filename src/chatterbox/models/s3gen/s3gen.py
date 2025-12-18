@@ -99,11 +99,21 @@ class S3Token2Mel(torch.nn.Module):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
-        log_message("[INIT] Starting S3Token2Mel initialization")
+    def __init__(self, flow_type="causal", use_meanflow=False):
+        """
+        Initialize S3Token2Mel.
+
+        Args:
+            flow_type: Type of flow ("causal" for streaming/turbo)
+            use_meanflow: Enable meanflow for single-step generation (Turbo)
+        """
+        log_message(f"[INIT] Starting S3Token2Mel initialization (flow_type={flow_type}, use_meanflow={use_meanflow})")
         log_memory("start_s3token2mel_init")
 
         super().__init__()
+
+        self.flow_type = flow_type
+        self.use_meanflow = use_meanflow
 
         log_message("[INIT] Creating tokenizer...")
         log_memory("before_tokenizer")
@@ -161,6 +171,7 @@ class S3Token2Mel(torch.nn.Module):
             spk_emb_dim=80,
             cfm_params=cfm_params,
             estimator=estimator,
+            use_meanflow=self.use_meanflow,  # Enable meanflow for Turbo
         )
         log_memory("after_cfm_decoder")
 
@@ -339,11 +350,18 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
-        log_message("[INIT] Starting S3Token2Wav initialization")
+    def __init__(self, flow_type="causal", use_meanflow=False):
+        """
+        Initialize S3Token2Wav (S3Gen).
+
+        Args:
+            flow_type: Type of flow ("causal" for streaming/turbo)
+            use_meanflow: Enable meanflow for single-step generation (Turbo)
+        """
+        log_message(f"[INIT] Starting S3Token2Wav initialization (flow_type={flow_type}, use_meanflow={use_meanflow})")
         log_memory("start_s3token2wav_init")
 
-        super().__init__()
+        super().__init__(flow_type=flow_type, use_meanflow=use_meanflow)
 
         log_message("[INIT] Creating F0 predictor...")
         log_memory("before_f0_predictor")

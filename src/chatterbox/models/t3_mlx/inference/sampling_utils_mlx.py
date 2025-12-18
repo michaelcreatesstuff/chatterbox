@@ -10,7 +10,7 @@ from typing import List
 import mlx.core as mx
 
 
-def apply_repetition_penalty(logits: mx.array, generated_ids: List[mx.array], penalty: float) -> mx.array:
+def apply_repetition_penalty(logits: mx.array, generated_ids: List[int], penalty: float) -> mx.array:
     """
     Apply repetition penalty to logits (VECTORIZED).
 
@@ -20,7 +20,7 @@ def apply_repetition_penalty(logits: mx.array, generated_ids: List[mx.array], pe
 
     Args:
         logits: Logits tensor of shape (B, vocab_size)
-        generated_ids: List of previously generated token tensors
+        generated_ids: List of previously generated token IDs (Python ints for efficiency)
         penalty: Penalty factor (> 1.0 penalizes repetition)
 
     Returns:
@@ -29,11 +29,8 @@ def apply_repetition_penalty(logits: mx.array, generated_ids: List[mx.array], pe
     if len(generated_ids) == 0 or penalty == 1.0:
         return logits
 
-    # Flatten all generated IDs into a single array
-    all_ids = mx.concatenate([mx.reshape(t, [-1]) for t in generated_ids], axis=0)
-    
-    # Get unique token IDs using a set (executed on CPU, but small)
-    unique_ids = list(set(int(x) for x in all_ids.tolist()))
+    # Get unique token IDs - already Python ints, no conversion needed
+    unique_ids = list(set(generated_ids))
     
     if len(unique_ids) == 0:
         return logits

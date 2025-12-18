@@ -570,3 +570,189 @@ class T3MLX(nn.Module):
             cfg_weight=cfg_weight,
             show_progress=show_progress,
         )
+
+    def inference_turbo(
+        self,
+        *,
+        t3_cond: T3CondMLX,
+        text_tokens: mx.array,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 100,
+        repetition_penalty: float = 1.2,
+        max_new_tokens: int = 4096,
+        show_progress: bool = False,
+    ) -> mx.array:
+        """
+        Turbo inference without CFG (classifier-free guidance).
+        Optimized for Chatterbox-Turbo model with GPT2 backbone.
+
+        Simpler and faster than standard inference():
+        - No CFG (no dual forward pass)
+        - Streamlined logits processing
+        - Top-k sampling support
+        - Optimized for low latency
+
+        Args:
+            t3_cond: T3 conditioning (speaker embedding, etc.)
+            text_tokens: Input text tokens (1D or 2D)
+            temperature: Sampling temperature (higher = more random)
+            top_p: Nucleus sampling threshold
+            top_k: Top-k sampling threshold (0 = disabled)
+            repetition_penalty: Penalty for repeating tokens (>1 = less repetition)
+            max_new_tokens: Maximum speech tokens to generate
+            show_progress: Show progress bar
+
+        Returns:
+            Generated speech tokens (1, T_speech)
+        """
+        # Validate text tokens
+        if text_tokens.ndim == 1:
+            text_tokens = mx.expand_dims(text_tokens, 0)
+
+        _ensure_BOT_EOT(text_tokens, self.hp)
+
+        # Set memory limits
+        mx.set_cache_limit(0)
+
+        _log_t3_memory("turbo_start")
+
+        # Start with BOS token
+        bos_token = mx.array([[self.hp.start_speech_token]])
+
+        # Prepare conditioning (NO CFG, so cfg_weight=0.0)
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=bos_token,
+            cfg_weight=0.0,  # No CFG for Turbo
+        )
+
+        # BOS embedding
+        bos_embed = self.speech_emb(bos_token)
+        bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
+
+        # Combine conditioning and BOS
+        inputs_embeds = mx.concatenate([embeds, bos_embed], axis=1)
+
+        # Initialize backend if needed
+        if self.patched_model is None:
+            self.patched_model = T3MLXBackend(
+                llama_model=self.tfmr,
+                speech_emb=self.speech_emb,
+                speech_head=self.speech_head,
+                config=self.cfg,
+                alignment_stream_analyzer=None,
+            )
+        else:
+            self.patched_model.reset_state()
+
+        # Initial forward pass
+        output = self.patched_model(
+            inputs_embeds=inputs_embeds,
+            cache=None,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+
+        cache = output['cache']
+
+        # Force evaluation
+        if cache is not None and len(cache) > 0 and cache[0] is not None:
+            mx.eval(cache[0][0])
+
+        # Track generated tokens
+        generated_token_ids: List[int] = []  # For repetition penalty
+        generated_tokens: List[mx.array] = []  # For final result
+
+        # Import sampling utilities
+        from .inference.sampling_utils_mlx import (
+            apply_repetition_penalty,
+            apply_top_p,
+            apply_top_k,
+        )
+
+        _log_t3_memory("turbo_after_init")
+
+        # Generation loop
+        token_iterator = range(max_new_tokens)
+        if show_progress:
+            token_iterator = tqdm(token_iterator, desc="Turbo Sampling", dynamic_ncols=True)
+
+        for i in token_iterator:
+            # Get logits (single batch, no CFG)
+            logits = output['logits'][:, -1, :]  # (1, vocab)
+
+            # Apply repetition penalty
+            logits = apply_repetition_penalty(logits, generated_token_ids, repetition_penalty)
+
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            # Apply top-k (if enabled)
+            if top_k > 0:
+                logits = apply_top_k(logits, top_k)
+
+            # Apply top-p
+            logits = apply_top_p(logits, top_p)
+
+            # Sample next token
+            probs = mx.softmax(logits, axis=-1)
+            next_token = mx.random.categorical(mx.log(probs + 1e-10))
+            next_token = mx.reshape(next_token, (1, 1))
+
+            # Evaluate and extract token value
+            token_val = int(next_token[0, 0])
+
+            # Store token
+            generated_token_ids.append(token_val)
+            generated_tokens.append(next_token)
+
+            # Check for EOS
+            if token_val == self.hp.stop_speech_token:
+                logger.info(f"✅ Turbo EOS at step {i+1}")
+                break
+
+            # Get embedding for next token
+            next_embed = self.speech_emb(next_token)
+            next_embed = next_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+
+            # Forward with cache (no CFG, single batch)
+            output = self.patched_model(
+                inputs_embeds=next_embed,
+                cache=cache,
+                use_cache=True,
+                output_hidden_states=False,
+            )
+
+            cache = output['cache']
+
+            # Periodic memory management
+            if i > 0 and i % 25 == 0:
+                if cache is not None and len(cache) > 0 and cache[0] is not None:
+                    mx.eval(cache[0][0])
+                mx.clear_cache()
+
+        _log_t3_memory("turbo_complete")
+
+        # Concatenate generated tokens
+        if len(generated_tokens) > 0:
+            result = mx.concatenate(generated_tokens, axis=1)
+        else:
+            result = mx.array([[]], dtype=mx.int32)
+
+        # Force evaluation
+        mx.eval(result)
+
+        # Cleanup
+        del generated_tokens
+        del generated_token_ids
+        del cache
+        del output
+        mx.clear_cache()
+
+        import gc
+        gc.collect()
+
+        return result

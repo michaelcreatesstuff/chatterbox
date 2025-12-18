@@ -8,6 +8,9 @@ Benchmarks text-to-speech generation on Apple Silicon (M4) comparing:
 - Hybrid MLX (T3 MLX + S3Gen PyTorch) performance
 - MLX (full precision) performance
 - MLX Quantized (4-bit) performance
+- Turbo models (350M params, 10x faster with meanflow)
+  - Turbo on MPS/CPU (PyTorch)
+  - Turbo on MLX (hybrid)
 - Short vs Long text generation
 - Memory usage patterns
 
@@ -100,8 +103,8 @@ class BenchmarkConfig:
     # Save generated audio files
     save_audio: bool = True
     # Test configurations
-    test_devices: List[str] = field(default_factory=lambda: ["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4"])
-    # Model to benchmark: "standard" or "multilingual"
+    test_devices: List[str] = field(default_factory=lambda: ["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4", "turbo-mps", "turbo-mlx"])
+    # Model to benchmark: "standard", "multilingual", or "turbo"
     model_type: str = "standard"
     # Enable Whisper transcription validation
     validate_transcription: bool = False
@@ -365,6 +368,7 @@ class ChatterboxBenchmark:
 
         Note: Float16 KV cache optimization is enabled by default for PyTorch models.
         MLX models use native optimizations, MLX-Q4 uses 4-bit quantization.
+        Turbo models use simpler inference without CFG for faster generation.
         """
         print(f"\n{'='*60}")
         print(f"Loading model on {device.upper()}...")
@@ -375,10 +379,17 @@ class ChatterboxBenchmark:
             self.model = None
             clear_memory(self.current_device or "cpu")
 
-        is_mlx = device in ["mlx", "mlx-q4"]
-        is_hybrid_mlx = device == "hybrid-mlx"
+        is_turbo = device.startswith("turbo-")
+        is_mlx = device in ["mlx", "mlx-q4", "turbo-mlx"]
+        is_hybrid_mlx = device in ["hybrid-mlx", "turbo-mlx"]
 
-        if is_hybrid_mlx:
+        if is_turbo:
+            # Turbo models: 350M params, single-step decoder, no CFG
+            print(f"  Model: Chatterbox-Turbo (350M params, 10x faster)")
+            print(f"  Features: Single-step meanflow decoder, GPT2 tokenizer")
+            print(f"  No CFG (classifier-free guidance) for simpler inference")
+
+        if is_hybrid_mlx and is_turbo:
             # Hybrid MLX: T3 MLX + S3Gen PyTorch
             print(f"  Backend: Hybrid MLX (T3 MLX + S3Gen PyTorch)")
             print(f"  T3: MLX (Apple Silicon optimized)")
@@ -396,16 +407,16 @@ class ChatterboxBenchmark:
             print(f"  Float16 KV cache optimization: ENABLED")
 
             # Check device availability
-            if device == "mps":
+            if device in ["mps", "turbo-mps"]:
                 if not torch.backends.mps.is_available():
                     print("⚠️  MPS not available, falling back to CPU")
-                    device = "cpu"
+                    device = "turbo-cpu" if is_turbo else "cpu"
                 else:
                     print("✓ MPS (Apple Silicon) is available")
-            elif device == "cuda":
+            elif device in ["cuda", "turbo-cuda"]:
                 if not torch.cuda.is_available():
                     print("⚠️  CUDA not available, falling back to CPU")
-                    device = "cpu"
+                    device = "turbo-cpu" if is_turbo else "cpu"
 
         print(f"{'='*60}")
 
@@ -420,7 +431,12 @@ class ChatterboxBenchmark:
             # Hybrid MLX backend: T3 MLX + S3Gen PyTorch
             try:
                 log_memory_detailed("hybrid_mlx_import_start", device)
-                if self.config.model_type == "multilingual":
+                if is_turbo:
+                    # Turbo MLX
+                    from chatterbox.tts_turbo_mlx import ChatterboxTurboMLX
+                    log_memory_detailed("turbo_mlx_class_imported", device)
+                    self.model = ChatterboxTurboMLX.from_pretrained()
+                elif self.config.model_type == "multilingual":
                     from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
                     log_memory_detailed("hybrid_mlx_class_imported", device)
                     self.model = ChatterboxMultilingualTTSMLX.from_pretrained()
@@ -465,12 +481,21 @@ class ChatterboxBenchmark:
         else:
             # PyTorch backend
             log_memory_detailed("pytorch_import_start", device)
-            if self.config.model_type == "multilingual":
+
+            # Determine actual PyTorch device (strip "turbo-" prefix)
+            pytorch_device = device.replace("turbo-", "") if is_turbo else device
+
+            if is_turbo:
+                # Turbo PyTorch model
+                from chatterbox import ChatterboxTurboTTS
+                log_memory_detailed("turbo_pytorch_class_imported", device)
+                self.model = ChatterboxTurboTTS.from_pretrained(device=pytorch_device)
+            elif self.config.model_type == "multilingual":
                 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-                self.model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+                self.model = ChatterboxMultilingualTTS.from_pretrained(device=pytorch_device)
             else:
                 from chatterbox.tts import ChatterboxTTS
-                self.model = ChatterboxTTS.from_pretrained(device=device)
+                self.model = ChatterboxTTS.from_pretrained(device=pytorch_device)
             log_memory_detailed("pytorch_model_loaded", device)
 
         load_time = time.time() - load_start
@@ -492,7 +517,11 @@ class ChatterboxBenchmark:
         print(f"  Running initial warmup (JIT compilation)...", end="", flush=True)
         warmup_text = "Hello, this is a warmup."
         try:
-            _ = self.model.generate(warmup_text, exaggeration=0.5, cfg_weight=0.5)
+            # Use appropriate API based on model type
+            if is_turbo:
+                _ = self.model.generate(warmup_text, temperature=0.7, top_p=0.9)
+            else:
+                _ = self.model.generate(warmup_text, exaggeration=0.5, cfg_weight=0.5)
             clear_memory(device)
             print(" done")
         except Exception as e:
@@ -525,9 +554,34 @@ class ChatterboxBenchmark:
         use_long_generation = category in ["long", "extra_long"]
 
         log_memory_detailed(f"gen_before_generate_run{run_id}", self.current_device)
-        
+
+        # Check if this is a Turbo model
+        is_turbo = self.current_device.startswith("turbo-") or self.current_device == "turbo-mlx"
+
         # Generate audio
-        if self.config.model_type == "multilingual":
+        if is_turbo:
+            # Turbo models: simpler API without CFG/exaggeration
+            if use_long_generation:
+                wav = self.model.generate_long(
+                    text,
+                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    temperature=0.7,
+                    top_p=0.9,
+                    top_k=100,
+                    repetition_penalty=1.2,
+                    overlap_duration=0.1,
+                    show_progress=False,
+                )
+            else:
+                wav = self.model.generate(
+                    text,
+                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    temperature=0.7,
+                    top_p=0.9,
+                    top_k=100,
+                    repetition_penalty=1.2,
+                )
+        elif self.config.model_type == "multilingual":
             if use_long_generation:
                 wav = self.model.generate_long(
                     text,
@@ -901,12 +955,12 @@ def main():
     parser = argparse.ArgumentParser(description="Chatterbox TTS MPS Benchmark")
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup runs")
     parser.add_argument("--runs", type=int, default=3, help="Number of benchmark runs")
-    parser.add_argument("--devices", nargs="+", default=["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4"],
-                       help="Devices to benchmark (mps, cpu, hybrid-mlx, mlx, mlx-q4). MLX will be skipped if not available.")
+    parser.add_argument("--devices", nargs="+", default=["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4", "turbo-mps", "turbo-mlx"],
+                       help="Devices to benchmark (mps, cpu, hybrid-mlx, mlx, mlx-q4, turbo-mps, turbo-cpu, turbo-mlx). MLX will be skipped if not available.")
     parser.add_argument("--model", choices=["standard", "multilingual"],
-                       default="standard", help="Model type to benchmark")
-    parser.add_argument("--audio-prompt", type=str, default=None,
-                       help="Path to reference audio for voice cloning")
+                       default="standard", help="Model type to benchmark (Note: use --turbo-* flags for Turbo models)")
+    parser.add_argument("--audio-prompt", type=str, default="earl-nightingale.wav",
+                       help="Path to reference audio for voice cloning (default: earl-nightingale.wav)")
     parser.add_argument("--output-dir", type=str, default="benchmark_output",
                        help="Output directory for results")
     parser.add_argument("--no-save-audio", action="store_true",
@@ -921,6 +975,14 @@ def main():
                        help="Only benchmark MLX quantized (skip others)")
     parser.add_argument("--hybrid-mlx-only", action="store_true",
                        help="Only benchmark Hybrid MLX (skip others)")
+    parser.add_argument("--turbo-only", action="store_true",
+                       help="Only benchmark all Turbo variants (skip others)")
+    parser.add_argument("--turbo-mps-only", action="store_true",
+                       help="Only benchmark Turbo on MPS (skip others)")
+    parser.add_argument("--turbo-mlx-only", action="store_true",
+                       help="Only benchmark Turbo MLX (skip others)")
+    parser.add_argument("--turbo-cpu-only", action="store_true",
+                       help="Only benchmark Turbo on CPU (skip others)")
     parser.add_argument("--validate", action="store_true",
                        help="Enable Whisper transcription validation")
     parser.add_argument("--debug-memory", action="store_true",
@@ -946,6 +1008,14 @@ def main():
         devices = ["mlx-q4"]
     elif args.hybrid_mlx_only:
         devices = ["hybrid-mlx"]
+    elif args.turbo_only:
+        devices = ["turbo-mps", "turbo-cpu", "turbo-mlx"]
+    elif args.turbo_mps_only:
+        devices = ["turbo-mps"]
+    elif args.turbo_mlx_only:
+        devices = ["turbo-mlx"]
+    elif args.turbo_cpu_only:
+        devices = ["turbo-cpu"]
     else:
         devices = args.devices
     

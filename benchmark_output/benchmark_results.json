@@ -1,10 +1,10 @@
 {
   "config": {
-    "warmup_runs": 0,
+    "warmup_runs": 1,
     "benchmark_runs": 1,
     "model_type": "standard",
     "test_devices": [
-      "mlx-q4"
+      "turbo-mps"
     ]
   },
   "system": {
@@ -14,55 +14,55 @@
   },
   "results": [
     {
-      "device": "mlx-q4",
+      "device": "turbo-mps",
       "text_category": "short",
       "text_length_words": 5,
       "text_length_chars": 25,
-      "mean_time_seconds": 2.3087570667266846,
+      "mean_time_seconds": 3.3082432746887207,
       "std_time_seconds": 0,
-      "min_time_seconds": 2.3087570667266846,
-      "max_time_seconds": 2.3087570667266846,
-      "mean_realtime_factor": 1.1521350766329441,
-      "chars_per_second": 10.828337186399851,
-      "words_per_second": 2.16566743727997,
-      "audio_duration_seconds": 2.66,
-      "peak_memory_mb": 16265.515625,
-      "transcription": "Hello, how are you today?",
-      "word_error_rate": 0.0
+      "min_time_seconds": 3.3082432746887207,
+      "max_time_seconds": 3.3082432746887207,
+      "mean_realtime_factor": 0.6589600035399817,
+      "chars_per_second": 7.556880774541074,
+      "words_per_second": 1.511376154908215,
+      "audio_duration_seconds": 2.18,
+      "peak_memory_mb": 17745.75,
+      "transcription": null,
+      "word_error_rate": null
     },
     {
-      "device": "mlx-q4",
+      "device": "turbo-mps",
       "text_category": "medium",
       "text_length_words": 31,
       "text_length_chars": 256,
-      "mean_time_seconds": 22.8471999168396,
+      "mean_time_seconds": 29.68276810646057,
       "std_time_seconds": 0,
-      "min_time_seconds": 22.8471999168396,
-      "max_time_seconds": 22.8471999168396,
-      "mean_realtime_factor": 0.8981406944697704,
-      "chars_per_second": 11.204874161026376,
-      "words_per_second": 1.3568402304367877,
-      "audio_duration_seconds": 20.52,
-      "peak_memory_mb": 11802.65625,
-      "transcription": "Machine learning is transforming how we interact with computers. Natural language processing enables machines to understand and generate human speech. This technology has applications in virtual assistance, accessibility tools, and entertainment.",
-      "word_error_rate": 0.03225806451612903
+      "min_time_seconds": 29.68276810646057,
+      "max_time_seconds": 29.68276810646057,
+      "mean_realtime_factor": 0.5491401590828128,
+      "chars_per_second": 8.624532559828225,
+      "words_per_second": 1.0443769896666992,
+      "audio_duration_seconds": 16.3,
+      "peak_memory_mb": 12744.78125,
+      "transcription": null,
+      "word_error_rate": null
     },
     {
-      "device": "mlx-q4",
+      "device": "turbo-mps",
       "text_category": "long",
       "text_length_words": 94,
       "text_length_chars": 700,
-      "mean_time_seconds": 65.86609625816345,
+      "mean_time_seconds": 54.553776025772095,
       "std_time_seconds": 0,
-      "min_time_seconds": 65.86609625816345,
-      "max_time_seconds": 65.86609625816345,
-      "mean_realtime_factor": 0.7855331185440847,
-      "chars_per_second": 10.627622400093916,
-      "words_per_second": 1.4271378651554687,
-      "audio_duration_seconds": 51.74,
-      "peak_memory_mb": 12016.859375,
-      "transcription": "Artificial intelligence has made remarkable strides in recent years, particularly in the field of natural language processing. Text-to-speech systems have evolved from robotic-sounding voices to remarkably natural human-like speech. These advances are powered by deep-learning models that learn from vast amounts of human speech data. The ability to generate natural-sounding speech has numerous applications from making content accessible to visually impaired users, to creating audio books, to powering virtual assistants that feel more human. As the technology continues to improve, we can expect even more, life-like and expressive synthetic voices in the near future.",
-      "word_error_rate": 0.07446808510638298
+      "min_time_seconds": 54.553776025772095,
+      "max_time_seconds": 54.553776025772095,
+      "mean_realtime_factor": 0.7717156000367651,
+      "chars_per_second": 12.831375772582792,
+      "words_per_second": 1.7230704608896892,
+      "audio_duration_seconds": 42.1,
+      "peak_memory_mb": 12644.28125,
+      "transcription": null,
+      "word_error_rate": null
     }
   ]
 }
