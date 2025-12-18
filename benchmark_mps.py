@@ -575,7 +575,7 @@ class ChatterboxBenchmark:
             else:
                 wav = self.model.generate(
                     text,
-                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    audio_prompt=self.config.audio_prompt_path if run_id == 0 else None,
                     temperature=0.7,
                     top_p=0.9,
                     top_k=100,

@@ -249,10 +249,66 @@ class ChatterboxTurboTTS:
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
+    def prepare_conditionals_from_tensor(self, wav_tensor, exaggeration=0.5, norm_loudness=True, sr=24000):
+        """
+        Prepare conditionals from an audio tensor instead of a file path.
+        
+        Args:
+            wav_tensor: Audio waveform as torch tensor (1D or 2D with shape [1, N] or [C, N])
+            exaggeration: Emotion exaggeration factor
+            norm_loudness: Whether to normalize reference audio loudness
+            sr: Sample rate of input tensor (default 24000)
+        """
+        # Convert tensor to numpy
+        if isinstance(wav_tensor, torch.Tensor):
+            wav_np = wav_tensor.cpu().numpy()
+        else:
+            wav_np = wav_tensor
+        
+        # Handle multi-channel (take first channel)
+        if wav_np.ndim == 2:
+            wav_np = wav_np[0]
+        
+        wav_np = wav_np.astype(np.float32)
+        
+        # Resample to S3GEN_SR (24000) if needed
+        if sr != S3GEN_SR:
+            s3gen_ref_wav = librosa.resample(wav_np, orig_sr=sr, target_sr=S3GEN_SR)
+        else:
+            s3gen_ref_wav = wav_np
+        
+        assert len(s3gen_ref_wav) / S3GEN_SR > 5.0, "Audio prompt must be longer than 5 seconds!"
+
+        if norm_loudness:
+            s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, S3GEN_SR)
+
+        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        ref_16k_wav = ref_16k_wav.astype(np.float32)
+
+        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+
+        # Speech cond prompt tokens
+        if plen := self.t3.hp.speech_cond_prompt_len:
+            s3_tokzr = self.s3gen.tokenizer
+            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
+            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+
+        # Voice-encoder speaker embedding
+        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+
+        t3_cond = T3Cond(
+            speaker_emb=ve_embed,
+            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+        ).to(device=self.device)
+        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+
     def generate(
         self,
         text,
-        audio_prompt_path=None,
+        audio_prompt=None,
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
@@ -267,7 +323,7 @@ class ChatterboxTurboTTS:
         
         Args:
             text: Input text to synthesize (supports paralinguistic tags like [laugh], [cough])
-            audio_prompt_path: Path to reference audio for voice cloning (required on first call)
+            audio_prompt: Reference audio for voice cloning - can be a path (str) or tensor (required on first call)
             exaggeration: Emotion exaggeration factor (0.0 to 1.0) - IGNORED in Turbo
             cfg_weight: Classifier-free guidance weight - IGNORED in Turbo
             temperature: Sampling temperature (higher = more random)
@@ -280,8 +336,14 @@ class ChatterboxTurboTTS:
         Returns:
             Generated audio waveform as torch tensor (24kHz)
         """
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+        if audio_prompt is not None:
+            # Accept either a path string or a tensor
+            if isinstance(audio_prompt, (str, Path)):
+                self.prepare_conditionals(audio_prompt, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            elif isinstance(audio_prompt, torch.Tensor):
+                self.prepare_conditionals_from_tensor(audio_prompt, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            else:
+                raise ValueError(f"audio_prompt must be a path string or tensor, got {type(audio_prompt)}")
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 

@@ -166,12 +166,14 @@ class MaskedDiffWithXvec(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        # Use 1 timestep for meanflow (Turbo), 5 for standard
+        n_timesteps = 1 if getattr(self.decoder, 'use_meanflow', False) else 5
         feat, flow_cache = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5,  # Midpoint: 5 steps × 2 evals = 10 total (vs Euler 10 steps × 1 eval = 10)
+            n_timesteps=n_timesteps,
             prompt_len=mel_len1,
             flow_cache=flow_cache
         )
@@ -278,12 +280,14 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        # Use 1 timestep for meanflow (Turbo), 5 for standard
+        n_timesteps = 1 if getattr(self.decoder, 'use_meanflow', False) else 5
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5  # Midpoint: 5 steps × 2 evals = 10 total (vs Euler 10 steps × 1 eval = 10)
+            n_timesteps=n_timesteps
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2

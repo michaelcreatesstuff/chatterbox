@@ -1,12 +1,25 @@
 [project]
-name = "chatterbox"
+name = "chatterbox-mlx"
 version = "0.1.5"
-description = "Chatterbox: Open Source TTS and Voice Conversion by Resemble AI"
+description = "Chatterbox MLX: Open Source TTS for MLX, based off of Chatterbox by Resemble AI"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 authors = [
-    {name = "resemble-ai", email = "engineering@resemble.ai"}
+    {name = "michael-yang", email = "admin@cl6holdings.com"}
+]
+keywords = ["tts", "text-to-speech", "voice-cloning", "speech-synthesis", "ai", "multilingual"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "numpy==2.3.5",
@@ -23,6 +36,7 @@ dependencies = [
     "spacy>=3.8.3",
     "spacy-pkuseg==1.0.1",
     "pykakasi==2.3.0",
+    "pyloudnorm>=0.1.0",
     "russian-text-stresser@git+https://github.com/michaelcreatesstuff/add-stress-to-epub.git@60c5c3d31cd5472e394d64cf74d6f1d7b31425e2",
 
 ]
