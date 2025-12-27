@@ -23,6 +23,8 @@ import argparse
 import sys
 import time
 from pathlib import Path
+import numpy as np
+from scipy.io import wavfile
 
 
 # Benchmark test texts for different languages
@@ -55,7 +57,7 @@ BENCHMARK_TEXTS = {
 
 
 def run_benchmark(
-    languages=None, backend="hybrid-mlx", save_audio=True, output_dir="benchmark_output"
+    languages=None, backend="hybrid-mlx", save_audio_flag=True, output_dir="benchmark_output"
 ):
     """Run a quick multilingual benchmark."""
     import torchaudio as ta
@@ -89,7 +91,7 @@ def run_benchmark(
     print()
 
     # Create output dir if saving
-    if save_audio:
+    if save_audio_flag:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -131,9 +133,9 @@ def run_benchmark(
             f"       → {gen_time:.2f}s generation, {duration:.1f}s audio, RTF: {rtf:.2f}x"
         )
 
-        if save_audio:
+        if save_audio_flag:
             output_path = Path(output_dir) / f"benchmark_{lang}.wav"
-            ta.save(str(output_path), wav, model.sr)
+            save_audio(str(output_path), wav, model.sr)
 
     print("-" * 60)
     print()
@@ -158,7 +160,7 @@ def run_benchmark(
     )
     print("=" * 60)
 
-    if save_audio:
+    if save_audio_flag:
         print(f"\n📁 Audio files saved to: {output_dir}/")
 
     return 0
@@ -176,6 +178,33 @@ def get_default_device():
     except ImportError:
         pass
     return "cpu"
+
+
+def save_audio(output_path: str, wav, sample_rate: int):
+    """
+    Save audio to WAV file using scipy (workaround for torchcodec bug in PyTorch 2.9).
+
+    Args:
+        output_path: Path to save the WAV file
+        wav: Audio tensor or numpy array
+        sample_rate: Sample rate in Hz
+    """
+    import torch
+
+    # Convert to numpy array
+    if isinstance(wav, torch.Tensor):
+        wav_np = wav.cpu().numpy()
+    else:
+        wav_np = np.array(wav) if not isinstance(wav, np.ndarray) else wav
+
+    # Ensure the array is squeezed (remove batch dimension if present)
+    wav_np = np.squeeze(wav_np)
+
+    # Convert float32 to int16 for WAV file
+    wav_int16 = (wav_np * 32767).astype(np.int16)
+
+    # Save using scipy.io.wavfile (workaround for torchcodec bug in PyTorch 2.9)
+    wavfile.write(output_path, sample_rate, wav_int16)
 
 
 def generate_output_filename(text: str, lang: str) -> str:
@@ -272,7 +301,7 @@ Supported Languages:
         return run_benchmark(
             languages=args.languages,
             backend=args.backend,
-            save_audio=not args.no_save_audio,
+            save_audio_flag=not args.no_save_audio,
         )
 
     # Regular TTS mode - text is required
@@ -355,7 +384,7 @@ Supported Languages:
         gen_time = time.time() - gen_start
 
         # Save audio
-        ta.save(output_path, wav, model.sr)
+        save_audio(output_path, wav, model.sr)
 
         if not args.quiet:
             duration = wav.shape[-1] / model.sr

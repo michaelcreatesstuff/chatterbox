@@ -22,6 +22,7 @@ Designed for MacBook Pro M4 32GB.
 import torch
 import torchaudio as ta
 import numpy as np
+from scipy.io import wavfile
 import psutil
 import os
 import time
@@ -687,16 +688,22 @@ class ChatterboxBenchmark:
             if last_wav is not None:
                 output_path = Path(self.config.output_dir) / f"{self.current_device}_{category}.wav"
 
-                # Handle both torch tensors and numpy arrays
-                import torch
+                # Convert to numpy array and save with scipy (workaround for torchcodec bug in PyTorch 2.9)
                 if isinstance(last_wav, np.ndarray):
-                    wav_tensor = torch.from_numpy(last_wav).float()
+                    wav_np = last_wav
                 elif isinstance(last_wav, torch.Tensor):
-                    wav_tensor = last_wav.float().cpu()
+                    wav_np = last_wav.cpu().numpy()
                 else:
-                    wav_tensor = last_wav
-                    
-                ta.save(str(output_path), wav_tensor, self.model.sr)
+                    wav_np = np.array(last_wav)
+
+                # Ensure the array is squeezed (remove batch dimension if present)
+                wav_np = np.squeeze(wav_np)
+
+                # Convert float32 to int16 for WAV file
+                wav_int16 = (wav_np * 32767).astype(np.int16)
+
+                # Save using scipy.io.wavfile (workaround for torchcodec bug in PyTorch 2.9)
+                wavfile.write(str(output_path), self.model.sr, wav_int16)
 
                 print(f"  → Saved: {output_path}")
                 # Remove reference from the stored result so memory can be freed

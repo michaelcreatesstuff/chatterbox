@@ -24,6 +24,8 @@ import os
 import time
 import gc
 import statistics
+import numpy as np
+from scipy.io import wavfile
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -642,14 +644,22 @@ class MultilingualBenchmark:
                 output_path = Path(self.config.output_dir) / f"{self.current_device}_{language_code}.wav"
 
                 # Handle both torch tensors (PyTorch) and numpy arrays (MLX)
+                # Convert to numpy array and save with scipy (workaround for torchcodec bug in PyTorch 2.9)
                 if isinstance(last_wav, torch.Tensor):
-                    # Already a torch tensor
-                    wav_tensor = last_wav.float()
+                    # Convert torch tensor to numpy
+                    wav_np = last_wav.cpu().numpy()
                 else:
-                    # Numpy array (from MLX), convert to torch for torchaudio.save
-                    wav_tensor = torch.from_numpy(last_wav).float()
-                
-                ta.save(str(output_path), wav_tensor, self.model.sr)
+                    # Already numpy array (from MLX)
+                    wav_np = last_wav
+
+                # Ensure the array is squeezed (remove batch dimension if present)
+                wav_np = np.squeeze(wav_np)
+
+                # Convert float32 to int16 for WAV file
+                wav_int16 = (wav_np * 32767).astype(np.int16)
+
+                # Save using scipy.io.wavfile (workaround for torchcodec bug in PyTorch 2.9)
+                wavfile.write(str(output_path), self.model.sr, wav_int16)
 
                 print(f"  → Saved: {output_path}")
                 # Remove reference from the stored result so memory can be freed
