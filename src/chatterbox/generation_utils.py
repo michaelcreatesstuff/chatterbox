@@ -259,6 +259,7 @@ def crossfade_chunks(
     1. Pre-allocating the output array
     2. Using vectorized numpy operations
     3. Pre-computing fade curves once
+    4. Trimming the S3Gen artifact-reduction fade from the first chunk
 
     Args:
         chunks: List of audio torch tensors
@@ -280,11 +281,22 @@ def crossfade_chunks(
 
     # Convert all chunks to numpy and flatten
     processed = []
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         if isinstance(chunk, torch.Tensor):
             chunk = chunk.cpu().numpy()
         if chunk.ndim == 2:
             chunk = chunk.squeeze(0)
+
+        # Trim S3Gen's artifact-reduction fade from the first chunk only
+        # S3Gen applies a 40ms fade-in (20ms silence + 20ms fade) to reduce reference spillover
+        # This is good for reducing artifacts but cuts off initial consonants in the first chunk
+        # We trim only the silent portion (20ms) to preserve the fade-in while fixing truncation
+        if i == 0 and len(chunks) > 1:
+            # Trim only the first 20ms (480 samples at 24kHz) which is the silent portion
+            trim_samples = sample_rate // 50  # 20ms at 24kHz = 480 samples
+            if len(chunk) > trim_samples:
+                chunk = chunk[trim_samples:]
+
         processed.append(chunk)
 
     # For small number of chunks, use simple approach
@@ -305,6 +317,14 @@ def crossfade_chunks(
                 )
             else:
                 result = np.concatenate([result, chunk])
+
+        # Apply very short fade-out at the very end to eliminate any trailing artifacts/pops
+        # Fade only the last 3ms and only down to 10% to avoid creating trailing silence
+        tail_fade_samples = min(sample_rate // 333, len(result))  # 3ms fade
+        if tail_fade_samples > 0:
+            tail_fade = np.linspace(1.0, 0.1, tail_fade_samples, dtype=np.float32)
+            result[-tail_fade_samples:] *= tail_fade
+
         return torch.from_numpy(result)
 
     # Optimized approach for many chunks: pre-allocate and batch process
@@ -338,6 +358,14 @@ def crossfade_chunks(
         else:
             result[current_pos : current_pos + len(chunk)] = chunk
             current_pos += len(chunk)
+
+    # Apply very short fade-out at the very end to eliminate any trailing artifacts/pops
+    # This prevents clicks from S3Gen artifacts at the end of the last chunk
+    # Fade only the last 3ms and only down to 10% to avoid creating trailing silence
+    tail_fade_samples = min(sample_rate // 333, len(result))  # 3ms fade
+    if tail_fade_samples > 0:
+        tail_fade = np.linspace(1.0, 0.1, tail_fade_samples, dtype=np.float32)
+        result[-tail_fade_samples:] *= tail_fade
 
     return torch.from_numpy(result)
 
