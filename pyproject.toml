@@ -3,7 +3,7 @@ name = "chatterbox-mlx"
 version = "0.1.2"
 description = "Chatterbox MLX: Open Source TTS and Voice Conversion for MLX. Based off of Chatterbox by Resemble AI"
 readme = "README.md"
-requires-python = "==3.11"
+requires-python = ">=3.11,<3.12"
 license = "MIT"
 authors = [
     {name = "michael-yang", email = "contact@michaelyang.ai"}
