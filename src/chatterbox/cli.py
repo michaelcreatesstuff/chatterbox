@@ -57,7 +57,10 @@ BENCHMARK_TEXTS = {
 
 
 def run_benchmark(
-    languages=None, backend="hybrid-mlx", save_audio_flag=True, output_dir="benchmark_output"
+    languages=None,
+    backend="hybrid-mlx",
+    save_audio_flag=True,
+    output_dir="benchmark_output",
 ):
     """Run a quick multilingual benchmark."""
     import torchaudio as ta
