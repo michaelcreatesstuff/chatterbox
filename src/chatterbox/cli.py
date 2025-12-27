@@ -63,7 +63,6 @@ def run_benchmark(
     output_dir="benchmark_output",
 ):
     """Run a quick multilingual benchmark."""
-    import torchaudio as ta
 
     if languages is None:
         languages = ["en", "es", "fr", "de", "ja", "zh"]
@@ -335,8 +334,6 @@ Supported Languages:
         return 1
 
     try:
-        import torchaudio as ta
-
         # Load the appropriate model
         if not args.quiet:
             print("⏳ Loading model...")
