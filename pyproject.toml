@@ -1,30 +1,63 @@
 [project]
-name = "chatterbox"
-version = "0.1.4"
-description = "Chatterbox: Open Source TTS and Voice Conversion by Resemble AI"
+name = "chatterbox-mlx"
+version = "0.1.2"
+description = "Chatterbox MLX: Open Source TTS and Voice Conversion for MLX. Based off of Chatterbox by Resemble AI"
 readme = "README.md"
-requires-python = ">=3.10"
-license = {file = "LICENSE"}
+requires-python = ">=3.11"
+license = "MIT"
 authors = [
-    {name = "resemble-ai", email = "engineering@resemble.ai"}
+    {name = "michael-yang", email = "contact@michaelyang.ai"}
+]
+keywords = ["tts", "text-to-speech", "voice-cloning", "speech-synthesis", "ai", "multilingual", "mlx", "apple-silicon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "numpy==2.3.5",
+    "scipy>=1.11.0",
     "librosa==0.11.0",
     "s3tokenizer",
-    "torch==2.8.0",
-    "torchaudio==2.8.0",
-    "torchcodec==0.7.0",
+    "torch>=2.9.0",
+    "torchaudio>=2.9.0",
+    "torchcodec>=0.7.0",
     "transformers==4.57.3",
     "diffusers==0.35.2",
     "resemble-perth==1.0.1",
     "conformer==0.3.2",
     "safetensors>=0.7.0",
+    "huggingface-hub>=0.20.0",
+    "spacy>=3.8.3",
     "spacy-pkuseg==1.0.1",
     "pykakasi==2.3.0",
-    "russian-text-stresser@git+https://github.com/michaelcreatesstuff/add-stress-to-epub.git@60c5c3d31cd5472e394d64cf74d6f1d7b31425e2",
-
+    "psutil==7.2.0",
 ]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx==0.29.4",
+    "mlx-lm==0.28.3",
+]
+dev = [
+    "mlx-whisper>=0.4.0",
+    "parakeet-mlx==0.4.1",
+    "black==25.12.0",
+    "ruff==0.14.10",
+    "pytest==9.0.2",
+    "build==1.3.0",
+    "twine==6.2.0",
+]
+
+[project.scripts]
+chatterbox = "chatterbox.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/michaelcreatesstuff/chatterbox"
