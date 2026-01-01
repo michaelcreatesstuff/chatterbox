@@ -62,6 +62,9 @@ def run_benchmark(
     save_audio_flag=True,
     output_dir="benchmark_output",
     seed=None,
+    voice=None,
+    exaggeration=0.5,
+    cfg_weight=0.5,
 ):
     """Run a quick multilingual benchmark."""
 
@@ -73,6 +76,8 @@ def run_benchmark(
     print("=" * 60)
     print(f"   Backend: {backend}")
     print(f"   Languages: {', '.join(languages)}")
+    if voice:
+        print(f"   Voice: {voice}")
     print("=" * 60)
     print()
 
@@ -113,7 +118,17 @@ def run_benchmark(
         print(f'   [{lang}] {lang_name}: "{text[:40]}..."')
 
         gen_start = time.time()
-        wav = model.generate(text, language_id=lang, seed=seed)
+        gen_kwargs = {
+            "language_id": lang,
+            "exaggeration": exaggeration,
+            "cfg_weight": cfg_weight,
+        }
+        if seed is not None:
+            gen_kwargs["seed"] = seed
+        if voice:
+            gen_kwargs["audio_prompt_path"] = voice
+
+        wav = model.generate(text, **gen_kwargs)
         gen_time = time.time() - gen_start
 
         duration = wav.shape[-1] / model.sr
@@ -307,11 +322,23 @@ Supported Languages:
 
     # Handle benchmark mode
     if args.benchmark:
+        # Validate voice file exists if provided
+        if args.voice and not Path(args.voice).exists():
+            print(f"❌ Error: Voice file not found: '{args.voice}'", file=sys.stderr)
+            print(
+                "   Please provide a valid path to a WAV file for voice cloning.",
+                file=sys.stderr,
+            )
+            return 1
+
         return run_benchmark(
             languages=args.languages,
             backend=args.backend,
             save_audio_flag=not args.no_save_audio,
             seed=args.seed,
+            voice=args.voice,
+            exaggeration=args.exaggeration,
+            cfg_weight=args.cfg,
         )
 
     # Regular TTS mode - text is required

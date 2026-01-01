@@ -671,28 +671,21 @@ class ChatterboxMultilingualTTSMLX:
             Generated audio waveform as torch tensor
         """
         # Seed all RNGs if seed is provided (for both T3 MLX and S3Gen PyTorch)
-        # Important: We save and restore the RNG state to ensure determinism
-        rng_state_mlx = None
-        rng_state_torch = None
-        rng_state_numpy = None
-
         if seed is not None:
-            # Save current RNG states (to restore later if needed)
-            rng_state_torch = torch.get_rng_state()
-            rng_state_numpy = np.random.get_state()
-
             # Set all seeds
             mx.random.seed(seed)
             torch.manual_seed(seed)
             np.random.seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
-            if hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            if hasattr(torch, "mps") and torch.backends.mps.is_available():
                 # MPS backend seed setting
                 torch.mps.manual_seed(seed)
 
             # Set deterministic behavior for PyTorch operations
-            torch.use_deterministic_algorithms(False)  # Some ops don't support deterministic
+            torch.use_deterministic_algorithms(
+                False
+            )  # Some ops don't support deterministic
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
@@ -763,10 +756,11 @@ class ChatterboxMultilingualTTSMLX:
         speech_tokens_pt = torch.from_numpy(speech_tokens_np)
 
         # DEBUG: Log token counts before filtering
-        import os
         if os.getenv("CHATTERBOX_DEBUG"):
             print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
-            print(f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}")
+            print(
+                f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
+            )
             # Check for SOS/EOS
             SOS, EOS = 6561, 6562
             has_sos = (speech_tokens_pt == SOS).any().item()
@@ -777,9 +771,13 @@ class ChatterboxMultilingualTTSMLX:
             if has_eos:
                 eos_pos = (speech_tokens_pt == EOS).nonzero(as_tuple=True)[0][0].item()
                 print(f"[DEBUG] EOS (6562) found at position {eos_pos}")
-                print(f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}")
+                print(
+                    f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}"
+                )
             else:
-                print(f"[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens")
+                print(
+                    "[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens"
+                )
             # Count special tokens
             num_special = (speech_tokens_pt >= 6561).sum().item()
             print(f"[DEBUG] Special tokens (>=6561): {num_special}")
@@ -794,8 +792,12 @@ class ChatterboxMultilingualTTSMLX:
         speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
 
         if os.getenv("CHATTERBOX_DEBUG"):
-            print(f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens")
-            print(f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}")
+            print(
+                f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens"
+            )
+            print(
+                f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
+            )
 
         speech_tokens_pt = speech_tokens_pt.to(self.device)
 
@@ -818,7 +820,9 @@ class ChatterboxMultilingualTTSMLX:
 
         if os.getenv("CHATTERBOX_DEBUG"):
             wav_duration = len(wav) / self.sr
-            print(f"[DEBUG] S3Gen output: {len(wav)} samples = {wav_duration:.2f}s @ {self.sr}Hz")
+            print(
+                f"[DEBUG] S3Gen output: {len(wav)} samples = {wav_duration:.2f}s @ {self.sr}Hz"
+            )
             print(f"[DEBUG] Text preview: {text[:60]}...")
 
         return torch.from_numpy(wav).unsqueeze(0)
