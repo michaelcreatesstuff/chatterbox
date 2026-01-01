@@ -14,6 +14,8 @@ This module provides common functionality for:
 from typing import List
 import re
 import logging
+import subprocess
+import sys
 import numpy as np
 import torch
 
@@ -32,6 +34,55 @@ except ImportError:
 
 # Cache for loaded spacy models
 _spacy_models = {}
+
+# Track models that failed to download to avoid repeated attempts
+_failed_downloads = set()
+
+
+def _download_spacy_model(model_name: str) -> bool:
+    """
+    Attempt to download a spacy model using subprocess.
+
+    Args:
+        model_name: The spacy model to download (e.g., "en_core_web_sm")
+
+    Returns:
+        True if download succeeded, False otherwise
+    """
+    # Check if already failed
+    if model_name in _failed_downloads:
+        logger.debug(f"Skipping download for {model_name} (previously failed)")
+        return False
+
+    logger.info(f"Downloading spacy model: {model_name} (this may take a minute)...")
+
+    try:
+        # Use python -m spacy download which handles pip installation
+        result = subprocess.run(
+            [sys.executable, "-m", "spacy", "download", model_name],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout for download
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Successfully downloaded spacy model: {model_name}")
+            return True
+        else:
+            logger.warning(
+                f"Failed to download spacy model {model_name}: {result.stderr.strip()}"
+            )
+            _failed_downloads.add(model_name)
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Download timeout for spacy model {model_name}")
+        _failed_downloads.add(model_name)
+        return False
+    except Exception as e:
+        logger.warning(f"Error downloading spacy model {model_name}: {e}")
+        _failed_downloads.add(model_name)
+        return False
 
 
 def _get_spacy_model(lang: str = "en"):
@@ -78,13 +129,36 @@ def _get_spacy_model(lang: str = "en"):
                     _spacy_models[lang] = nlp
                     logger.info(f"Loaded spacy model: {model_name}")
                 except OSError:
-                    # Model not installed, use blank model with sentencizer
-                    logger.warning(
-                        f"Spacy model {model_name} not found, using blank {lang} model with sentencizer"
+                    # Model not installed, attempt to download
+                    logger.info(
+                        f"Spacy model {model_name} not found, attempting download..."
                     )
-                    nlp = spacy.blank(lang)
-                    nlp.add_pipe("sentencizer")
-                    _spacy_models[lang] = nlp
+
+                    if _download_spacy_model(model_name):
+                        # Download succeeded, try loading again
+                        try:
+                            nlp = spacy.load(model_name)
+                            _spacy_models[lang] = nlp
+                            logger.info(
+                                f"Successfully loaded downloaded model: {model_name}"
+                            )
+                        except Exception as e:
+                            # Download succeeded but load failed - fall back
+                            logger.warning(
+                                f"Downloaded {model_name} but failed to load: {e}. "
+                                f"Using blank {lang} model with sentencizer"
+                            )
+                            nlp = spacy.blank(lang)
+                            nlp.add_pipe("sentencizer")
+                            _spacy_models[lang] = nlp
+                    else:
+                        # Download failed, use blank model with sentencizer
+                        logger.warning(
+                            f"Could not download {model_name}, using blank {lang} model with sentencizer"
+                        )
+                        nlp = spacy.blank(lang)
+                        nlp.add_pipe("sentencizer")
+                        _spacy_models[lang] = nlp
             else:
                 # Language not in map, use blank model
                 logger.info(
