@@ -337,6 +337,7 @@ class T3MLX(nn.Module):
         cfg_weight: float = 0.5,
         show_progress: bool = True,
         use_alignment_analyzer: bool = True,  # Enable by default for quality control
+        seed: Optional[int] = None,
     ) -> mx.array:
         """
         Generate speech tokens autoregressively.
@@ -351,6 +352,9 @@ class T3MLX(nn.Module):
             repetition_penalty: Penalty for repeated tokens
             cfg_weight: Classifier-free guidance weight
             use_alignment_analyzer: Whether to use alignment analyzer for quality control
+            seed: Random seed for deterministic generation. If None (default),
+                  uses non-deterministic generation. Set to an integer (e.g., 42)
+                  for reproducible results.
 
         Returns:
             Generated speech token IDs
@@ -465,6 +469,9 @@ class T3MLX(nn.Module):
             apply_top_p,
             apply_min_p,
         )
+
+        # Note: Seed is now handled at a higher level in mtl_tts_mlx._generate_single()
+        # to ensure both T3 (MLX) and S3Gen (PyTorch) use the same seed
 
         # Generation loop
         token_iterator = range(max_new_tokens)
@@ -598,6 +605,7 @@ class T3MLX(nn.Module):
         cfg_weight: float = 0.5,
         show_progress: bool = True,
         use_alignment_analyzer: bool = True,  # Enable alignment analyzer by default
+        seed: Optional[int] = None,
         # PyTorch API compatibility - ignored for MLX
         initial_speech_tokens: Optional[mx.array] = None,
         prepend_prompt_speech_tokens: Optional[mx.array] = None,
@@ -622,6 +630,9 @@ class T3MLX(nn.Module):
             repetition_penalty: Penalty for repeated tokens
             cfg_weight: Classifier-free guidance weight
             use_alignment_analyzer: Whether to use alignment analyzer for quality control
+            seed: Random seed for deterministic generation. If None (default),
+                  uses non-deterministic generation. Set to an integer (e.g., 42)
+                  for reproducible results.
             initial_speech_tokens: Ignored (for PyTorch API compatibility)
             prepend_prompt_speech_tokens: Ignored (for PyTorch API compatibility)
             num_return_sequences: Ignored (for PyTorch API compatibility)
@@ -643,4 +654,5 @@ class T3MLX(nn.Module):
             cfg_weight=cfg_weight,
             show_progress=show_progress,
             use_alignment_analyzer=use_alignment_analyzer,
+            seed=seed,
         )

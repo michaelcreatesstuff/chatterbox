@@ -470,6 +470,7 @@ class ChatterboxMultilingualTTSMLX:
         top_p: float = 1.0,
         max_new_tokens: Optional[int] = None,
         show_progress: bool = True,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate speech from text using hybrid MLX/PyTorch pipeline.
@@ -488,6 +489,9 @@ class ChatterboxMultilingualTTSMLX:
             top_p: Nucleus sampling threshold
             max_new_tokens: Maximum tokens to generate (auto-estimated if None)
             show_progress: Whether to show token-level progress bar (default True)
+            seed: Random seed for deterministic generation. If None (default),
+                  uses non-deterministic generation. Set to an integer (e.g., 42)
+                  for reproducible results.
 
         Returns:
             Generated audio waveform as torch tensor
@@ -562,6 +566,7 @@ class ChatterboxMultilingualTTSMLX:
                 min_p=min_p,
                 top_p=top_p,
                 show_progress=show_progress,  # Use caller's preference
+                seed=seed,
             )
 
             gen_time = _time.time() - gen_start
@@ -587,6 +592,9 @@ class ChatterboxMultilingualTTSMLX:
             print_chunk_generating(i, num_chunks, sentence)
             chunk_start = _time.time()
 
+            # Increment seed for each chunk to avoid repetition
+            chunk_seed = seed + i if seed is not None else None
+
             chunk_audio = self._generate_single(
                 sentence,
                 language_id=language_id,
@@ -597,6 +605,7 @@ class ChatterboxMultilingualTTSMLX:
                 min_p=min_p,
                 top_p=top_p,
                 show_progress=False,  # Suppress token progress, observability handles chunk progress
+                seed=chunk_seed,
             )
 
             chunk_time = _time.time() - chunk_start
@@ -641,6 +650,7 @@ class ChatterboxMultilingualTTSMLX:
         min_p: float = 0.05,
         top_p: float = 1.0,
         show_progress: bool = True,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate speech for a single sentence/chunk (internal method).
@@ -655,10 +665,41 @@ class ChatterboxMultilingualTTSMLX:
             min_p: Minimum probability threshold
             top_p: Nucleus sampling threshold
             show_progress: Whether to show token-level progress bar
+            seed: Random seed for deterministic generation
 
         Returns:
             Generated audio waveform as torch tensor
         """
+        # Seed all RNGs if seed is provided (for both T3 MLX and S3Gen PyTorch)
+        # Important: We save and restore the RNG state to ensure determinism
+        rng_state_mlx = None
+        rng_state_torch = None
+        rng_state_numpy = None
+
+        if seed is not None:
+            # Save current RNG states (to restore later if needed)
+            rng_state_torch = torch.get_rng_state()
+            rng_state_numpy = np.random.get_state()
+
+            # Set all seeds
+            mx.random.seed(seed)
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            if hasattr(torch, 'mps') and torch.backends.mps.is_available():
+                # MPS backend seed setting
+                torch.mps.manual_seed(seed)
+
+            # Set deterministic behavior for PyTorch operations
+            torch.use_deterministic_algorithms(False)  # Some ops don't support deterministic
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+            # Optional debug logging
+            if os.getenv("CHATTERBOX_DEBUG"):
+                print(f"[SEED] Setting seed={seed}")
+
         # Normalize and tokenize
         text = punc_norm(text)
 
@@ -709,6 +750,7 @@ class ChatterboxMultilingualTTSMLX:
                 min_p=min_p,
                 top_p=top_p,
                 show_progress=show_progress,
+                seed=seed,
             )
 
         # Extract conditional batch (first one)
@@ -720,22 +762,64 @@ class ChatterboxMultilingualTTSMLX:
         speech_tokens_np = np.array(speech_tokens).astype(np.int64)
         speech_tokens_pt = torch.from_numpy(speech_tokens_np)
 
+        # DEBUG: Log token counts before filtering
+        import os
+        if os.getenv("CHATTERBOX_DEBUG"):
+            print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
+            print(f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}")
+            # Check for SOS/EOS
+            SOS, EOS = 6561, 6562
+            has_sos = (speech_tokens_pt == SOS).any().item()
+            has_eos = (speech_tokens_pt == EOS).any().item()
+            if has_sos:
+                sos_pos = (speech_tokens_pt == SOS).nonzero(as_tuple=True)[0][0].item()
+                print(f"[DEBUG] SOS (6561) found at position {sos_pos}")
+            if has_eos:
+                eos_pos = (speech_tokens_pt == EOS).nonzero(as_tuple=True)[0][0].item()
+                print(f"[DEBUG] EOS (6562) found at position {eos_pos}")
+                print(f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}")
+            else:
+                print(f"[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens")
+            # Count special tokens
+            num_special = (speech_tokens_pt >= 6561).sum().item()
+            print(f"[DEBUG] Special tokens (>=6561): {num_special}")
+
         # Drop invalid tokens (SOS/EOS)
         speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
 
+        if os.getenv("CHATTERBOX_DEBUG"):
+            print(f"[DEBUG] After drop_invalid_tokens: {len(speech_tokens_pt)} tokens")
+
         # Filter out tokens >= 6561 (special tokens)
         speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
+
+        if os.getenv("CHATTERBOX_DEBUG"):
+            print(f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens")
+            print(f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}")
+
         speech_tokens_pt = speech_tokens_pt.to(self.device)
+
+        # Re-seed PyTorch RNG right before S3Gen to ensure determinism
+        # This is necessary because T3 generation may have consumed random numbers
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
 
         # Generate waveform with S3Gen (PyTorch/MPS)
         with torch.inference_mode():
             wav, sources = self.s3gen.inference(
                 speech_tokens=speech_tokens_pt,
                 ref_dict=self.conds.gen,
+                finalize=False,  # Enable lookahead trimming to prevent extra audio generation
             )
             if sources is not None:
                 del sources
             wav = wav.squeeze(0).detach().cpu().numpy()
+
+        if os.getenv("CHATTERBOX_DEBUG"):
+            wav_duration = len(wav) / self.sr
+            print(f"[DEBUG] S3Gen output: {len(wav)} samples = {wav_duration:.2f}s @ {self.sr}Hz")
+            print(f"[DEBUG] Text preview: {text[:60]}...")
 
         return torch.from_numpy(wav).unsqueeze(0)
 
@@ -777,6 +861,7 @@ class ChatterboxMultilingualTTSMLX:
         max_new_tokens: Optional[int] = None,
         progress_callback=None,
         show_progress: bool = False,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate long-form speech with adaptive chunking strategy.
@@ -798,6 +883,7 @@ class ChatterboxMultilingualTTSMLX:
             overlap_duration: Duration in seconds of crossfade between chunks
             max_new_tokens: Maximum tokens to generate per chunk
             progress_callback: Optional callback function for progress monitoring
+            seed: Random seed for deterministic generation
 
         Returns:
             torch.Tensor: Generated audio waveform with shape (1, num_samples)
@@ -883,6 +969,9 @@ class ChatterboxMultilingualTTSMLX:
             print_chunk_generating(i, num_chunks, chunk_text)
             chunk_start = _time.time()
 
+            # Increment seed for each chunk to avoid repetition
+            chunk_seed = seed + i if seed is not None else None
+
             # Generate chunk
             chunk_audio = self._generate_single(
                 chunk_text,
@@ -894,6 +983,7 @@ class ChatterboxMultilingualTTSMLX:
                 min_p=min_p,
                 top_p=top_p,
                 show_progress=False,  # Suppress token progress, observability handles chunk progress
+                seed=chunk_seed,
             )
 
             chunk_time = _time.time() - chunk_start

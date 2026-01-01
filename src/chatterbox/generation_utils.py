@@ -377,13 +377,16 @@ def crossfade_chunks(
 
 def estimate_max_tokens(text: str, model_max: int = 4096) -> int:
     """
-    Estimate reasonable max_new_tokens based on text length.
+    Estimate reasonable max_new_tokens based on text length using adaptive buffering.
 
-    Uses word-based estimation:
-    - Average speaking rate: ~150 words/minute = 2.5 words/second
-    - Speech tokens: 25 tokens/second
-    - Therefore: ~10 tokens per word on average
-    - Safety buffer: 1.5x to handle slow speech and pauses
+    Uses empirically-derived token/word ratios with length-adaptive safety margins:
+    - Very short (1-9 words): ~10 tokens/word, 1.3x safety buffer (low variance)
+    - Medium (10-19 words): ~12 tokens/word, 2.2x safety buffer (high variance)
+    - Long (20+ words): ~12 tokens/word, 1.5x safety buffer (stabilizes)
+
+    The higher buffer for medium-length texts accounts for increased variance in
+    token generation for sentences that are complex enough to have variation but
+    not long enough for statistical averaging.
 
     Args:
         text: Input text
@@ -393,10 +396,26 @@ def estimate_max_tokens(text: str, model_max: int = 4096) -> int:
         Estimated max_new_tokens value
     """
     word_count = len(text.split())
-    # ~10 tokens per word, with 1.5x safety buffer
-    estimated_tokens = word_count * 10 * 1.5
+
+    # Adaptive estimation based on empirical token usage patterns
+    if word_count <= 9:
+        # Very short: low variance, minimal buffer needed
+        # But set reasonable minimum to avoid too-small allocations
+        base_tokens = word_count * 10
+        estimated_tokens = base_tokens * 1.3
+        estimated_tokens = max(estimated_tokens, 80)  # Minimum 80 tokens
+    elif word_count <= 19:
+        # Medium: highest variance, needs larger safety buffer
+        # This range shows token/word ratios from 11-18, so use conservative estimate
+        base_tokens = word_count * 12
+        estimated_tokens = base_tokens * 2.2
+    else:
+        # Long: variance stabilizes, can use tighter buffer
+        base_tokens = word_count * 12
+        estimated_tokens = base_tokens * 1.5
+
     return min(
-        max(int(estimated_tokens), 100),  # At least 100 tokens minimum
+        int(estimated_tokens),
         model_max,  # Never exceed model max
     )
 

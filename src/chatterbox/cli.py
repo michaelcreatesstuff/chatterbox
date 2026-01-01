@@ -61,6 +61,7 @@ def run_benchmark(
     backend="hybrid-mlx",
     save_audio_flag=True,
     output_dir="benchmark_output",
+    seed=None,
 ):
     """Run a quick multilingual benchmark."""
 
@@ -112,7 +113,7 @@ def run_benchmark(
         print(f'   [{lang}] {lang_name}: "{text[:40]}..."')
 
         gen_start = time.time()
-        wav = model.generate(text, language_id=lang)
+        wav = model.generate(text, language_id=lang, seed=seed)
         gen_time = time.time() - gen_start
 
         duration = wav.shape[-1] / model.sr
@@ -295,6 +296,12 @@ Supported Languages:
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress messages"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for deterministic generation (default: None = non-deterministic)",
+    )
 
     args = parser.parse_args()
 
@@ -304,6 +311,7 @@ Supported Languages:
             languages=args.languages,
             backend=args.backend,
             save_audio_flag=not args.no_save_audio,
+            seed=args.seed,
         )
 
     # Regular TTS mode - text is required
@@ -377,6 +385,10 @@ Supported Languages:
             gen_kwargs["language_id"] = args.lang
         elif args.lang != "en":
             gen_kwargs["language_id"] = args.lang
+
+        # Add seed if specified
+        if args.seed is not None:
+            gen_kwargs["seed"] = args.seed
 
         # Only time the actual generation
         gen_start = time.time()

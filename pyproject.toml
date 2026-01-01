@@ -1,9 +1,9 @@
 [project]
 name = "chatterbox-mlx"
-version = "0.1.2"
+version = "0.1.2alpha11"
 description = "Chatterbox MLX: Open Source TTS and Voice Conversion for MLX. Based off of Chatterbox by Resemble AI"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = "MIT"
 authors = [
     {name = "michael-yang", email = "contact@michaelyang.ai"}
@@ -17,7 +17,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -39,13 +38,11 @@ dependencies = [
     "spacy-pkuseg==1.0.1",
     "pykakasi==2.3.0",
     "psutil==7.2.0",
-]
-
-[project.optional-dependencies]
-mlx = [
     "mlx==0.29.4",
     "mlx-lm==0.28.3",
 ]
+
+[project.optional-dependencies]
 dev = [
     "mlx-whisper>=0.4.0",
     "parakeet-mlx==0.4.1",

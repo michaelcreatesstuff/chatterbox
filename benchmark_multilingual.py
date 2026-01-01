@@ -36,6 +36,55 @@ from benchmark_audio_quality import (
     AudioQualityMetrics,
 )
 
+# Enable verbose memory logging for debugging memory spikes
+DEBUG_MEMORY = os.environ.get("DEBUG_MEMORY", "0") == "1"
+
+
+def log_memory_detailed(label: str, device: str = "mps"):
+    """
+    Log detailed memory information for debugging memory spikes.
+
+    Uses the existing get_memory_info() from chatterbox.models.utils.
+    Set DEBUG_MEMORY=1 environment variable to enable verbose output.
+
+    Args:
+        label: Description of the checkpoint (e.g., "after_model_load")
+        device: Current device being benchmarked
+    """
+    if not DEBUG_MEMORY:
+        return
+
+    info = get_memory_info()
+
+    parts = [f"[MEM] {label}:"]
+    parts.append(f"Sys={info['sys_used_gb']:.2f}GB ({info['sys_percent']:.0f}%)")
+
+    if 'wired_gb' in info:
+        parts.append(f"Wired={info['wired_gb']:.2f}GB")
+    if 'active_gb' in info:
+        parts.append(f"Active={info['active_gb']:.2f}GB")
+    if 'compressed_gb' in info:
+        parts.append(f"Comp={info['compressed_gb']:.2f}GB")
+
+    # MPS-specific memory
+    if device in ["mps", "hybrid-mlx"] and 'mps_allocated_mb' in info:
+        parts.append(f"MPS={info['mps_allocated_mb']:.0f}MB")
+    if 'mps_driver_mb' in info:
+        parts.append(f"MPSDriver={info['mps_driver_mb']:.0f}MB")
+
+    # MLX-specific: check if mlx is available and get its memory
+    if device in ["mlx", "mlx-q4", "hybrid-mlx"]:
+        try:
+            import mlx.core as mx
+            # MLX uses unified memory, but we can track active arrays
+            # MLX doesn't have direct memory query, but eval forces computation
+            mx.eval(mx.array([0]))  # Ensure any pending ops complete
+            parts.append("MLX=unified")
+        except ImportError:
+            pass
+
+    print(" | ".join(parts))
+
 
 # ============================================================================
 # Benchmark Configuration
@@ -58,6 +107,8 @@ class MultilingualBenchmarkConfig:
     test_devices: List[str] = field(default_factory=lambda: ["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4"])
     # Languages to test (subset of supported languages)
     test_languages: List[str] = field(default_factory=lambda: ["en", "es", "fr", "de", "ja", "zh"])
+    # Text categories to test (short, long, or both)
+    test_categories: List[str] = field(default_factory=lambda: ["short"])
     # Enable Whisper transcription validation
     validate_transcription: bool = False
     # Note: MLX backends will be skipped gracefully if not yet available
@@ -339,6 +390,7 @@ class MultilingualRunResult:
     device: str
     language_code: str
     language_name: str
+    text_category: str  # "short" or "long"
     text_length_words: int
     text_length_chars: int
     generation_time_seconds: float
@@ -357,6 +409,7 @@ class MultilingualBenchmarkResult:
     device: str
     language_code: str
     language_name: str
+    text_category: str  # "short" or "long"
     text_preview: str
     text_length_words: int
     text_length_chars: int
@@ -463,12 +516,17 @@ class MultilingualBenchmark:
         mem_before = get_memory_mb()
         load_start = time.time()
 
+        log_memory_detailed("before_model_load", device)
+
         # Load model based on backend
         if is_hybrid_mlx:
             # Hybrid MLX backend: T3 MLX + S3Gen PyTorch
             try:
+                log_memory_detailed("hybrid_mlx_import_start", device)
                 from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
+                log_memory_detailed("hybrid_mlx_class_imported", device)
                 self.model = ChatterboxMultilingualTTSMLX.from_pretrained()
+                log_memory_detailed("hybrid_mlx_model_loaded", device)
             except (ImportError, RuntimeError, AttributeError) as e:
                 print(f"\n⚠️  Hybrid MLX backend not available")
                 print(f"    Error: {str(e)[:100]}")
@@ -476,15 +534,20 @@ class MultilingualBenchmark:
         elif is_mlx:
             # MLX backend - check if fully implemented
             try:
+                log_memory_detailed("pure_mlx_import_start", device)
                 from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
+                log_memory_detailed("pure_mlx_class_imported", device)
                 self.model = ChatterboxMultilingualTTSMLX.from_pretrained()
+                log_memory_detailed("pure_mlx_model_loaded", device)
 
                 # Apply quantization if requested
                 if device == "mlx-q4":
                     print("  Applying 4-bit quantization...")
+                    log_memory_detailed("mlx_q4_before_quantize", device)
                     from chatterbox.models.t3_mlx.quantization.quantize_mlx import QuantizedT3MLX
                     # Quantize the underlying T3 model
                     self.model.model = QuantizedT3MLX(self.model.model, bits=4, group_size=64).model
+                    log_memory_detailed("mlx_q4_after_quantize", device)
                     print("  ✓ Quantization complete")
             except (ImportError, RuntimeError, AttributeError) as e:
                 print(f"\n⚠️  MLX backend not fully implemented yet")
@@ -494,11 +557,15 @@ class MultilingualBenchmark:
                 raise RuntimeError(f"MLX backend not available: {e}")
         else:
             # PyTorch backend
+            log_memory_detailed("pytorch_import_start", device)
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
             self.model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+            log_memory_detailed("pytorch_model_loaded", device)
 
         load_time = time.time() - load_start
         mem_after = get_memory_mb()
+
+        log_memory_detailed("after_model_load_complete", device)
 
         print(f"✓ Model loaded in {load_time:.2f}s")
         print(f"  Memory: {mem_before:.1f} → {mem_after:.1f} MB (+{mem_after - mem_before:.1f} MB)")
@@ -514,35 +581,69 @@ class MultilingualBenchmark:
         text: str,
         language_id: str,
         language_name: str,
+        category: str = "short",
         run_id: int = 0,
         keep_wav: bool = False
     ) -> MultilingualRunResult:
-        """Run a single TTS generation and collect metrics."""
+        """Run a single TTS generation and collect metrics.
+
+        Args:
+            text: Text to generate
+            language_id: Language code (e.g., "en", "es")
+            language_name: Full language name (e.g., "English")
+            category: Text category ("short" or "long")
+            run_id: Run number (used for audio prompt handling)
+            keep_wav: Whether to keep the waveform in the result
+        """
+        log_memory_detailed(f"gen_start_run{run_id}", self.current_device)
         clear_memory(self.current_device)
+        log_memory_detailed(f"gen_after_clear_run{run_id}", self.current_device)
 
         mem_before = get_memory_mb()
         gpu_mem_before = get_gpu_memory_mb(self.current_device)
 
         start_time = time.time()
 
+        # Use generate_long() for long texts to avoid truncation
+        use_long_generation = category == "long"
+
+        log_memory_detailed(f"gen_before_generate_run{run_id}", self.current_device)
+
         # Generate audio
-        wav = self.model.generate(
-            text,
-            language_id=language_id,
-            audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
-            exaggeration=0.5,
-            cfg_weight=0.5,
-            show_progress=False,  # Suppress tqdm for clean benchmark output
-        )
+        if use_long_generation:
+            wav = self.model.generate_long(
+                text,
+                language_id=language_id,
+                audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                exaggeration=0.5,
+                cfg_weight=0.5,
+                overlap_duration=0.1,
+                show_progress=False,  # Suppress tqdm for clean benchmark output
+            )
+        else:
+            wav = self.model.generate(
+                text,
+                language_id=language_id,
+                audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                exaggeration=0.5,
+                cfg_weight=0.5,
+                show_progress=False,  # Suppress tqdm for clean benchmark output
+            )
 
         generation_time = time.time() - start_time
+
+        log_memory_detailed(f"gen_after_generate_run{run_id}", self.current_device)
 
         mem_after = get_memory_mb()
         gpu_mem_after = get_gpu_memory_mb(self.current_device)
 
         # Calculate audio duration
         sample_rate = self.model.sr
-        audio_samples = wav.shape[-1]
+        # Handle both torch tensors and numpy arrays (MLX returns numpy)
+        if hasattr(wav, 'shape'):
+            audio_samples = wav.shape[-1]
+        else:
+            audio_samples = len(wav) if len(wav.shape) == 1 else wav.shape[-1]
         audio_duration = audio_samples / sample_rate
 
         # Calculate real-time factor
@@ -552,6 +653,7 @@ class MultilingualBenchmark:
             device=self.current_device,
             language_code=language_id,
             language_name=language_name,
+            text_category=category,
             text_length_words=word_count(text),
             text_length_chars=char_count(text),
             generation_time_seconds=generation_time,
@@ -568,23 +670,30 @@ class MultilingualBenchmark:
         if not keep_wav:
             del wav
             clear_memory(self.current_device)
+            log_memory_detailed(f"gen_after_cleanup_run{run_id}", self.current_device)
 
         return result
 
-    def benchmark_language(self, language_code: str, text: str, language_name: str) -> MultilingualBenchmarkResult:
+    def benchmark_language(self, language_code: str, text: str, language_name: str, category: str = "short") -> MultilingualBenchmarkResult:
         """Run complete benchmark on a single language."""
         text_words = word_count(text)
         text_chars = char_count(text)
         preview = text[:50] + "..." if len(text) > 50 else text
 
-        print(f"\n  Testing: {language_name} ({language_code})")
+        print(f"\n  Testing: {language_name} ({language_code}) - {category.upper()}")
         print(f"  Text: {preview}")
         print(f"  Length: {text_words} words, {text_chars} chars")
+
+        # Indicate which generation method will be used
+        if category == "long":
+            print(f"  Method: generate_long() with chunking (50 words/chunk)")
+        else:
+            print(f"  Method: generate() (single-pass)")
 
         # Warmup runs
         print(f"  Warmup runs: ", end="", flush=True)
         for i in range(self.config.warmup_runs):
-            self.run_single_generation(text, language_code, language_name, run_id=i)
+            self.run_single_generation(text, language_code, language_name, category=category, run_id=i)
             print(".", end="", flush=True)
         print(" done")
 
@@ -596,6 +705,7 @@ class MultilingualBenchmark:
             keep = self.config.save_audio and (i == self.config.benchmark_runs - 1)
             result = self.run_single_generation(
                 text, language_code, language_name,
+                category=category,
                 run_id=i + self.config.warmup_runs,
                 keep_wav=keep
             )
@@ -616,6 +726,7 @@ class MultilingualBenchmark:
             device=self.current_device,
             language_code=language_code,
             language_name=language_name,
+            text_category=category,
             text_preview=preview,
             text_length_words=text_words,
             text_length_chars=text_chars,
@@ -641,7 +752,7 @@ class MultilingualBenchmark:
         if self.config.save_audio:
             last_wav = run_results[-1].wav
             if last_wav is not None:
-                output_path = Path(self.config.output_dir) / f"{self.current_device}_{language_code}.wav"
+                output_path = Path(self.config.output_dir) / f"{self.current_device}_{language_code}_{category}.wav"
 
                 # Handle both torch tensors (PyTorch) and numpy arrays (MLX)
                 # Convert to numpy array and save with scipy (workaround for torchcodec bug in PyTorch 2.9)
@@ -702,6 +813,7 @@ class MultilingualBenchmark:
         print(f"Benchmark Runs: {self.config.benchmark_runs}")
         print(f"Devices to Test: {', '.join(self.config.test_devices)}")
         print(f"Languages to Test: {', '.join(self.config.test_languages)}")
+        print(f"Categories to Test: {', '.join(self.config.test_categories)}")
         if self.config.audio_prompt_path:
             print(f"Reference Audio: {self.config.audio_prompt_path}")
         if self.config.validate_transcription:
@@ -727,13 +839,21 @@ class MultilingualBenchmark:
             print(f"{'─'*60}")
 
             for lang_code in self.config.test_languages:
-                if lang_code not in MULTILINGUAL_TEXTS:
-                    print(f"⚠️  Skipping {lang_code}: No test text available")
-                    continue
+                for category in self.config.test_categories:
+                    # Select text based on category
+                    if category == "long":
+                        if lang_code not in MULTILINGUAL_LONG_TEXTS:
+                            print(f"⚠️  Skipping {lang_code} (long): No long test text available")
+                            continue
+                        lang_name, text = MULTILINGUAL_LONG_TEXTS[lang_code]
+                    else:  # short
+                        if lang_code not in MULTILINGUAL_TEXTS:
+                            print(f"⚠️  Skipping {lang_code}: No test text available")
+                            continue
+                        lang_name, text = MULTILINGUAL_TEXTS[lang_code]
 
-                lang_name, text = MULTILINGUAL_TEXTS[lang_code]
-                result = self.benchmark_language(lang_code, text, lang_name)
-                self.results.append(result)
+                    result = self.benchmark_language(lang_code, text, lang_name, category=category)
+                    self.results.append(result)
 
     def print_summary(self):
         """Print benchmark summary table."""
@@ -744,72 +864,84 @@ class MultilingualBenchmark:
         print("      MLX results use native optimizations, MLX-Q4 uses 4-bit quantization")
         print("="*100)
 
-        # Group results by device
+        # Group results by device and category
         devices = list(set(r.device for r in self.results))
         languages = sorted(set(r.language_code for r in self.results))
+        categories = sorted(set(r.text_category for r in self.results))
 
-        # Header
-        print(f"\n{'Language':<20} ", end="")
-        for device in devices:
-            print(f"│ {device.upper():<35} ", end="")
-        print()
-
-        print(f"{'─'*20} ", end="")
-        for device in devices:
-            print(f"│ {'─'*35} ", end="")
-        print()
-
-        # Data rows
-        for lang_code in languages:
-            lang_results = [r for r in self.results if r.language_code == lang_code]
-            if not lang_results:
+        # Print separate table for each category
+        for category in categories:
+            category_results = [r for r in self.results if r.text_category == category]
+            if not category_results:
                 continue
 
-            lang_name = lang_results[0].language_name
-            lang_display = f"{lang_name} ({lang_code})"
-            print(f"{lang_display:<20} ", end="")
+            print(f"\n{'='*100}")
+            print(f"{category.upper()} TEXT RESULTS")
+            print(f"{'='*100}")
 
+            # Header
+            print(f"\n{'Language':<20} ", end="")
             for device in devices:
-                dev_result = next((r for r in lang_results if r.device == device), None)
-                if dev_result:
-                    time_str = f"{dev_result.mean_time:.2f}s"
-                    rtf_str = f"{dev_result.mean_realtime_factor:.2f}x RTF"
-                    print(f"│ {time_str:<10} {rtf_str:<23} ", end="")
-                else:
-                    print(f"│ {'N/A':<35} ", end="")
+                print(f"│ {device.upper():<35} ", end="")
             print()
 
-        # Speedup comparisons
-        if len(devices) > 1:
-            print(f"\n{'─'*100}")
-            print("Performance Comparisons by Language:")
+            print(f"{'─'*20} ", end="")
+            for device in devices:
+                print(f"│ {'─'*35} ", end="")
+            print()
 
-            # Define baseline as MPS or CPU if MPS not available
-            baseline_device = "mps" if "mps" in devices else ("cpu" if "cpu" in devices else devices[0])
-
-            for lang_code in languages:
-                lang_results = [r for r in self.results if r.language_code == lang_code]
+            # Data rows
+            category_langs = sorted(set(r.language_code for r in category_results))
+            for lang_code in category_langs:
+                lang_results = [r for r in category_results if r.language_code == lang_code]
                 if not lang_results:
                     continue
 
-                baseline_result = next((r for r in lang_results if r.device == baseline_device), None)
-                if not baseline_result or baseline_result.mean_time == 0:
-                    continue
-
-                lang_name = baseline_result.language_name
-                print(f"\n  {lang_name} ({lang_code}) - vs {baseline_device.upper()}:")
+                lang_name = lang_results[0].language_name
+                lang_display = f"{lang_name} ({lang_code})"
+                print(f"{lang_display:<20} ", end="")
 
                 for device in devices:
-                    if device == baseline_device:
+                    dev_result = next((r for r in lang_results if r.device == device), None)
+                    if dev_result:
+                        time_str = f"{dev_result.mean_time:.2f}s"
+                        rtf_str = f"{dev_result.mean_realtime_factor:.2f}x RTF"
+                        print(f"│ {time_str:<10} {rtf_str:<23} ", end="")
+                    else:
+                        print(f"│ {'N/A':<35} ", end="")
+                print()
+
+            # Speedup comparisons for this category
+            if len(devices) > 1:
+                print(f"\n{'─'*100}")
+                print(f"Performance Comparisons ({category.upper()}):")
+
+                # Define baseline as MPS or CPU if MPS not available
+                baseline_device = "mps" if "mps" in devices else ("cpu" if "cpu" in devices else devices[0])
+
+                for lang_code in category_langs:
+                    lang_results = [r for r in category_results if r.language_code == lang_code]
+                    if not lang_results:
                         continue
 
-                    dev_result = next((r for r in lang_results if r.device == device), None)
-                    if dev_result and dev_result.mean_time > 0:
-                        speedup = baseline_result.mean_time / dev_result.mean_time
-                        if speedup > 1:
-                            print(f"    {device.upper():<10}: {speedup:.2f}x faster")
-                        else:
-                            print(f"    {device.upper():<10}: {1/speedup:.2f}x slower")
+                    baseline_result = next((r for r in lang_results if r.device == baseline_device), None)
+                    if not baseline_result or baseline_result.mean_time == 0:
+                        continue
+
+                    lang_name = baseline_result.language_name
+                    print(f"\n  {lang_name} ({lang_code}) - vs {baseline_device.upper()}:")
+
+                    for device in devices:
+                        if device == baseline_device:
+                            continue
+
+                        dev_result = next((r for r in lang_results if r.device == device), None)
+                        if dev_result and dev_result.mean_time > 0:
+                            speedup = baseline_result.mean_time / dev_result.mean_time
+                            if speedup > 1:
+                                print(f"    {device.upper():<10}: {speedup:.2f}x faster")
+                            else:
+                                print(f"    {device.upper():<10}: {1/speedup:.2f}x slower")
 
         # Average performance
         print(f"\n{'─'*100}")
@@ -852,6 +984,7 @@ class MultilingualBenchmark:
                 "audio_prompt_path": self.config.audio_prompt_path,
                 "test_devices": self.config.test_devices,
                 "test_languages": self.config.test_languages,
+                "test_categories": self.config.test_categories,
             },
             "system": {
                 "mps_available": torch.backends.mps.is_available(),
@@ -863,6 +996,7 @@ class MultilingualBenchmark:
                     "device": r.device,
                     "language_code": r.language_code,
                     "language_name": r.language_name,
+                    "text_category": r.text_category,
                     "text_preview": r.text_preview,
                     "text_length_words": r.text_length_words,
                     "text_length_chars": r.text_length_chars,
@@ -917,12 +1051,17 @@ Example:
                        help="Path to reference audio for voice cloning (REQUIRED)")
     parser.add_argument("--languages", nargs="+", default=["en", "es", "fr", "de", "ja", "zh"],
                        help="Language codes to test (default: en es fr de ja zh)")
+    parser.add_argument("--categories", nargs="+", default=["short"],
+                       choices=["short", "long"],
+                       help="Text categories to test: short (single-pass) or long (chunked). Default: short")
     parser.add_argument("--output-dir", type=str, default="benchmark_multilingual_output",
                        help="Output directory for results")
     parser.add_argument("--no-save-audio", action="store_true",
                        help="Don't save generated audio files")
     parser.add_argument("--validate", action="store_true",
                        help="Validate generated audio using MLX Whisper transcription and compute WER")
+    parser.add_argument("--debug-memory", action="store_true",
+                       help="Enable detailed memory logging for debugging memory spikes")
     parser.add_argument("--mps-only", action="store_true",
                        help="Only benchmark MPS (skip others)")
     parser.add_argument("--cpu-only", action="store_true",
@@ -935,6 +1074,13 @@ Example:
                        help="Only benchmark MLX quantized (skip others)")
 
     args = parser.parse_args()
+
+    # Enable memory debugging if requested
+    if args.debug_memory:
+        os.environ["DEBUG_MEMORY"] = "1"
+        global DEBUG_MEMORY
+        DEBUG_MEMORY = True
+        print("🔍 Memory debugging enabled - detailed memory logs will be printed")
 
     # Validate languages
     invalid_langs = [lang for lang in args.languages if lang not in MULTILINGUAL_TEXTS]
@@ -963,6 +1109,7 @@ Example:
         test_devices=devices,
         audio_prompt_path=args.audio_prompt,
         test_languages=args.languages,
+        test_categories=args.categories,
         output_dir=args.output_dir,
         save_audio=not args.no_save_audio,
         validate_transcription=args.validate,
