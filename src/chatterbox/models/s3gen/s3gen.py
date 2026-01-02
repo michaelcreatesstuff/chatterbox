@@ -252,7 +252,7 @@ class S3Token2Mel(torch.nn.Module):
 
         # Make sure mel_len = 2 * stoken_len (happens when the input is not padded to multiple of 40ms)
         if ref_mels_24.shape[1] != 2 * ref_speech_tokens.shape[1]:
-            logging.warning(
+            logging.debug(
                 "Reference mel length is not equal to 2 * reference token length.\n"
             )
             log_message(

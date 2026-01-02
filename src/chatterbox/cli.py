@@ -115,7 +115,7 @@ def run_benchmark(
             continue
 
         lang_name, text = BENCHMARK_TEXTS[lang]
-        print(f'   [{lang}] {lang_name}: "{text[:40]}..."')
+        print(f'   [{lang}] {lang_name}: "{text}"')
 
         gen_start = time.time()
         gen_kwargs = {
@@ -358,7 +358,7 @@ Supported Languages:
 
     if not args.quiet:
         print("🎤 Chatterbox MLX")
-        print(f"   Text: \"{args.text[:50]}{'...' if len(args.text) > 50 else ''}\"")
+        print(f"   Text: \"{args.text}\"")
         print(f"   Language: {args.lang}")
         print(f"   Backend: {args.backend}")
         print(f"   Output: {output_path}")
