@@ -31,7 +31,7 @@ from scipy.io import wavfile
 BENCHMARK_TEXTS = {
     "en": (
         "English",
-        "Hello, this is a test of multilingual speech synthesis. The technology can generate natural sounding voices in many different languages.",
+        "Hello, this is a test of multilingual speech synthesis technology. The system can generate natural-sounding voices in many different languages around the world. This capability enables developers to create accessible applications that can communicate effectively with users in their native language, providing a truly personalized and highly engaging user experience.",
     ),
     "es": (
         "Spanish",
@@ -129,7 +129,12 @@ def run_benchmark(
             gen_kwargs["audio_prompt_path"] = voice
 
         wav = model.generate(text, **gen_kwargs)
-        gen_time = time.time() - gen_start
+
+        # Use model's internal generation time if available, otherwise use wall-clock time
+        if hasattr(model, 'last_generation_time') and model.last_generation_time is not None:
+            gen_time = model.last_generation_time
+        else:
+            gen_time = time.time() - gen_start
 
         duration = wav.shape[-1] / model.sr
         rtf = duration / gen_time

@@ -333,6 +333,9 @@ class ChatterboxTTS:
             print_chunk_completed(0, 1, gen_time, audio_duration)
             print_generation_complete(gen_time, audio_duration, 1)
 
+            # Store generation time for external use (e.g., benchmarking)
+            self.last_generation_time = gen_time
+
             return result
 
         # Multiple sentences - generate each and crossfade
@@ -382,6 +385,9 @@ class ChatterboxTTS:
         # Final summary
         total_audio_duration = len(watermarked_result) / self.sr
         print_generation_complete(total_time, total_audio_duration, num_chunks)
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         return torch.from_numpy(watermarked_result).unsqueeze(0)
 
@@ -645,6 +651,9 @@ class ChatterboxTTS:
         # Final summary
         total_audio_duration = len(watermarked_result) / self.sr
         print_generation_complete(total_time, total_audio_duration, num_chunks)
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         if progress_callback:
             progress_callback(

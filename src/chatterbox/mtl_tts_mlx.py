@@ -580,6 +580,9 @@ class ChatterboxMultilingualTTSMLX:
                 gen_time, audio_duration, 1, prefix="[MLX Multilingual] "
             )
 
+            # Store generation time for external use (e.g., benchmarking)
+            self.last_generation_time = gen_time
+
             clear_device_memory()
             return result
 
@@ -630,6 +633,9 @@ class ChatterboxMultilingualTTSMLX:
         print_generation_complete(
             total_time, total_audio_duration, num_chunks, prefix="[MLX Multilingual] "
         )
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         clear_device_memory()
 
@@ -1038,6 +1044,9 @@ class ChatterboxMultilingualTTSMLX:
         print_generation_complete(
             total_time, total_audio_duration, num_chunks, prefix="[MLX Multilingual] "
         )
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         if progress_callback:
             progress_callback(

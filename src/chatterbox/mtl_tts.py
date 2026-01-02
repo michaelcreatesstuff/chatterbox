@@ -449,6 +449,9 @@ class ChatterboxMultilingualTTS:
                 gen_time, audio_duration, 1, prefix="[Multilingual] "
             )
 
+            # Store generation time for external use (e.g., benchmarking)
+            self.last_generation_time = gen_time
+
             # Force memory cleanup after generation
             clear_device_memory()
 
@@ -496,6 +499,9 @@ class ChatterboxMultilingualTTS:
         print_generation_complete(
             total_time, total_audio_duration, num_chunks, prefix="[Multilingual] "
         )
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         # Force memory cleanup after generation
         clear_device_memory()
@@ -820,6 +826,9 @@ class ChatterboxMultilingualTTS:
         print_generation_complete(
             total_time, total_audio_duration, num_chunks, prefix="[Multilingual] "
         )
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         if progress_callback:
             progress_callback(

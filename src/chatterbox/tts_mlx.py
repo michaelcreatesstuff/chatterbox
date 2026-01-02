@@ -641,6 +641,9 @@ class ChatterboxTTSMLX:
             print_chunk_completed(0, 1, gen_time, audio_duration)
             print_generation_complete(gen_time, audio_duration)
 
+            # Store generation time for external use (e.g., benchmarking)
+            self.last_generation_time = gen_time
+
             return result
 
         # Multiple sentences - print overview and generate each with status updates
@@ -701,6 +704,9 @@ class ChatterboxTTSMLX:
         # Final summary
         total_audio_duration = len(watermarked_result) / self.sr
         print_generation_complete(total_time, total_audio_duration, num_chunks)
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         return torch.from_numpy(watermarked_result).unsqueeze(0)
 
@@ -872,6 +878,9 @@ class ChatterboxTTSMLX:
         # Final summary
         total_audio_duration = len(watermarked_result) / self.sr
         print_generation_complete(total_time, total_audio_duration, num_chunks)
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         return torch.from_numpy(watermarked_result).unsqueeze(0)
 
@@ -1443,6 +1452,9 @@ class ChatterboxTTSPureMLX:
             print_chunk_completed(0, 1, gen_time, audio_duration)
             print_generation_complete(gen_time, audio_duration, prefix="[PureMLX] ")
 
+            # Store generation time for external use (e.g., benchmarking)
+            self.last_generation_time = gen_time
+
             return result
 
         # Multiple sentences - print overview and generate each with status updates
@@ -1508,6 +1520,9 @@ class ChatterboxTTSPureMLX:
         print_generation_complete(
             total_time, total_audio_duration, num_chunks, prefix="[PureMLX] "
         )
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         return torch.from_numpy(watermarked_result).unsqueeze(0)
 
@@ -1685,5 +1700,8 @@ class ChatterboxTTSPureMLX:
         print_generation_complete(
             total_time, total_audio_duration, num_chunks, prefix="[PureMLX] "
         )
+
+        # Store generation time for external use (e.g., benchmarking)
+        self.last_generation_time = total_time
 
         return torch.from_numpy(watermarked_result).unsqueeze(0)
