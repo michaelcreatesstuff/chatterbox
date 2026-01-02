@@ -131,7 +131,10 @@ def run_benchmark(
         wav = model.generate(text, **gen_kwargs)
 
         # Use model's internal generation time if available, otherwise use wall-clock time
-        if hasattr(model, 'last_generation_time') and model.last_generation_time is not None:
+        if (
+            hasattr(model, "last_generation_time")
+            and model.last_generation_time is not None
+        ):
             gen_time = model.last_generation_time
         else:
             gen_time = time.time() - gen_start
@@ -358,7 +361,7 @@ Supported Languages:
 
     if not args.quiet:
         print("🎤 Chatterbox MLX")
-        print(f"   Text: \"{args.text}\"")
+        print(f'   Text: "{args.text}"')
         print(f"   Language: {args.lang}")
         print(f"   Backend: {args.backend}")
         print(f"   Output: {output_path}")
