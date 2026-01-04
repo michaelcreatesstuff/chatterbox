@@ -17,8 +17,20 @@ pip install chatterbox-mlx
 ### Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+ (tested with 3.11.12)
+- Python 3.11+ (tested primarily with 3.11.12. Also tested with 3.12.12 and 3.13.2)
 - ~4GB disk space for model weights
+
+**Important:** Python must be compiled with `lzma` support. If you're using pyenv:
+
+```bash
+# Install xz library first (provides liblzma)
+brew install xz
+
+# Then install Python (or reinstall if already installed)
+pyenv install 3.11.12  # or your preferred version
+```
+
+If you see an error about `ModuleNotFoundError: No module named '_lzma'`, you need to install `xz` and reinstall Python.
 
 ---
 
@@ -63,8 +75,9 @@ Generate speech directly from the terminal:
 import torchaudio as ta
 from chatterbox.tts_mlx import ChatterboxTTSMLX
 
-# Load model (downloads weights automatically on first run)
-model = ChatterboxTTSMLX.from_pretrained(device="mps")
+# Load model (downloads weights automatically on first run). Default is "cpu", choose "hybrid-mlx" for best performance on an Apple Silicon device.
+model = ChatterboxTTSMLX.from_pretrained(device="hybrid-mlx")
+
 
 # Generate speech
 text = "Hello! This is Chatterbox running with MLX optimization on Apple Silicon."
