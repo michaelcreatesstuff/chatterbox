@@ -361,11 +361,12 @@ def crossfade_chunks(
         if chunk.ndim == 2:
             chunk = chunk.squeeze(0)
 
-        # Trim S3Gen's artifact-reduction fade from the first chunk only
+        # Trim S3Gen's artifact-reduction fade from all chunks in multi-chunk generation
         # S3Gen applies a 40ms fade-in (20ms silence + 20ms fade) to reduce reference spillover
-        # This is good for reducing artifacts but cuts off initial consonants in the first chunk
+        # While this reduces artifacts, it can create audible discontinuities when crossfading
         # We trim only the silent portion (20ms) to preserve the fade-in while fixing truncation
-        if i == 0 and len(chunks) > 1:
+        # This also eliminates chip-specific differences (M1 vs M4) in how the fade interacts with crossfading
+        if len(chunks) > 1:
             # Trim only the first 20ms (480 samples at 24kHz) which is the silent portion
             trim_samples = sample_rate // 50  # 20ms at 24kHz = 480 samples
             if len(chunk) > trim_samples:

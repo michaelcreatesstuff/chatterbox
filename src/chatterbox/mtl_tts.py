@@ -491,7 +491,7 @@ class ChatterboxMultilingualTTS:
 
         # Crossfade chunks together
         print_crossfading(num_chunks)
-        result = crossfade_chunks(audio_chunks, self.sr, 0.05)
+        result = crossfade_chunks(audio_chunks, self.sr, 0.01)
 
         # Final summary
         result_np = result.numpy() if isinstance(result, torch.Tensor) else result

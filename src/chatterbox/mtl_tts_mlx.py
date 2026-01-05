@@ -556,6 +556,14 @@ class ChatterboxMultilingualTTSMLX:
             print_chunk_generating(0, 1, sentences[0])
             gen_start = _time.time()
 
+            # Ensure deterministic RNG even when user doesn't provide seed
+            # This prevents chip-specific artifacts (M1 vs M4) from MLX global RNG state
+            import time as _time_module
+
+            internal_seed = (
+                seed if seed is not None else int(_time_module.time() * 1000) % (2**31)
+            )
+
             result = self._generate_single(
                 sentences[0],
                 language_id=language_id,
@@ -566,7 +574,7 @@ class ChatterboxMultilingualTTSMLX:
                 min_p=min_p,
                 top_p=top_p,
                 show_progress=show_progress,  # Use caller's preference
-                seed=seed,
+                seed=internal_seed,
             )
 
             gen_time = _time.time() - gen_start
@@ -590,13 +598,23 @@ class ChatterboxMultilingualTTSMLX:
         audio_chunks = []
         total_start = _time.time()
 
+        # Ensure deterministic RNG for all chunks, even when user doesn't provide seed
+        # This prevents chip-specific artifacts (M1 vs M4) from accumulated RNG state
+        # If no seed provided, generate one based on current time for session consistency
+        import time as _time_module
+
+        internal_seed = (
+            seed if seed is not None else int(_time_module.time() * 1000) % (2**31)
+        )
+
         for i, sentence in enumerate(sentences):
             len(sentence.split())
             print_chunk_generating(i, num_chunks, sentence)
             chunk_start = _time.time()
 
             # Increment seed for each chunk to avoid repetition
-            chunk_seed = seed + i if seed is not None else None
+            # Always use a seed (either user-provided or internally generated)
+            chunk_seed = internal_seed + i
 
             chunk_audio = self._generate_single(
                 sentence,
@@ -625,7 +643,7 @@ class ChatterboxMultilingualTTSMLX:
 
         # Crossfade chunks together
         print_crossfading(num_chunks)
-        result = crossfade_chunks(audio_chunks, self.sr, 0.05)
+        result = crossfade_chunks(audio_chunks, self.sr, 0.01)
 
         # Final summary
         result_np = result.numpy() if isinstance(result, torch.Tensor) else result

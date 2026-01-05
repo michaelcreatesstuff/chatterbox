@@ -412,6 +412,7 @@ class T3MLX(nn.Module):
             alignment_analyzer = AlignmentStreamAnalyzerMLX(
                 text_tokens_slice=(len_cond, len_cond + len_text),
                 eos_idx=self.hp.stop_speech_token,
+                max_new_tokens=max_new_tokens,  # Pass max tokens for safety checks
             )
             logger.info("✓ AlignmentStreamAnalyzerMLX enabled for quality control")
 
