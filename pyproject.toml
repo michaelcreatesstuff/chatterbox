@@ -1,6 +1,6 @@
 [project]
 name = "chatterbox-mlx"
-version = "0.1.2alpha14"
+version = "1.0.0"
 description = "Chatterbox MLX: Open Source TTS and Voice Conversion for MLX. Based off of Chatterbox by Resemble AI"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
