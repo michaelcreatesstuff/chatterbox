@@ -17,7 +17,7 @@ pip install chatterbox-mlx
 ### Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+ (tested primarily with 3.11.12. Also tested with 3.12.12 and 3.13.2)
+- Python 3.11+ (tested primarily with 3.11.12. Also tested with 3.12.12)
 - ~4GB disk space for model weights
 
 **Important:** Python must be compiled with `lzma` support. If you're using pyenv:
