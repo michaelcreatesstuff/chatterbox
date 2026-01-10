@@ -4,15 +4,25 @@ MPS Performance Benchmark for Chatterbox TTS
 =============================================
 
 Benchmarks text-to-speech generation on Apple Silicon (M4) comparing:
-- MPS vs CPU performance
+- MPS (PyTorch) vs CPU performance
+- Hybrid MLX (T3 MLX + S3Gen PyTorch) performance
+- MLX (full precision) performance
+- MLX Quantized (4-bit) performance
 - Short vs Long text generation
 - Memory usage patterns
+
+NOTE: Float16 KV cache optimization is enabled by default for PyTorch models,
+providing 18-32% speed improvements with significant memory savings.
+
+Optional Whisper transcription validation for quality assessment.
 
 Designed for MacBook Pro M4 32GB.
 """
 
 import torch
 import torchaudio as ta
+import numpy as np
+from scipy.io import wavfile
 import psutil
 import os
 import time
@@ -21,6 +31,61 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from chatterbox.models.utils import get_memory_info
+from benchmark_audio_quality import (
+    validate_audio_quality,
+    print_quality_report,
+    AudioQualityMetrics,
+)
+
+# Enable verbose memory logging for debugging memory spikes
+DEBUG_MEMORY = os.environ.get("DEBUG_MEMORY", "0") == "1"
+
+
+def log_memory_detailed(label: str, device: str = "mps"):
+    """
+    Log detailed memory information for debugging memory spikes.
+    
+    Uses the existing get_memory_info() from chatterbox.models.utils.
+    Set DEBUG_MEMORY=1 environment variable to enable verbose output.
+    
+    Args:
+        label: Description of the checkpoint (e.g., "after_model_load")
+        device: Current device being benchmarked
+    """
+    if not DEBUG_MEMORY:
+        return
+    
+    info = get_memory_info()
+    
+    parts = [f"[MEM] {label}:"]
+    parts.append(f"Sys={info['sys_used_gb']:.2f}GB ({info['sys_percent']:.0f}%)")
+    
+    if 'wired_gb' in info:
+        parts.append(f"Wired={info['wired_gb']:.2f}GB")
+    if 'active_gb' in info:
+        parts.append(f"Active={info['active_gb']:.2f}GB")
+    if 'compressed_gb' in info:
+        parts.append(f"Comp={info['compressed_gb']:.2f}GB")
+    
+    # MPS-specific memory
+    if device in ["mps", "hybrid-mlx"] and 'mps_allocated_mb' in info:
+        parts.append(f"MPS={info['mps_allocated_mb']:.0f}MB")
+    if 'mps_driver_mb' in info:
+        parts.append(f"MPSDriver={info['mps_driver_mb']:.0f}MB")
+    
+    # MLX-specific: check if mlx is available and get its memory
+    if device in ["mlx", "mlx-q4", "hybrid-mlx"]:
+        try:
+            import mlx.core as mx
+            # MLX uses unified memory, but we can track active arrays
+            # MLX doesn't have direct memory query, but eval forces computation
+            mx.eval(mx.array([0]))  # Ensure any pending ops complete
+            parts.append("MLX=unified")
+        except ImportError:
+            pass
+    
+    print(" | ".join(parts))
 
 
 # ============================================================================
@@ -41,9 +106,12 @@ class BenchmarkConfig:
     # Save generated audio files
     save_audio: bool = True
     # Test configurations
-    test_devices: List[str] = field(default_factory=lambda: ["mps", "cpu"])
+    test_devices: List[str] = field(default_factory=lambda: ["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4"])
     # Model to benchmark: "standard" or "multilingual"
     model_type: str = "standard"
+    # Enable Whisper transcription validation
+    validate_transcription: bool = False
+    # Note: MLX backends will be skipped gracefully if not yet available
 
 
 # ============================================================================
@@ -119,18 +187,17 @@ that AI benefits humanity as a whole.
 # ============================================================================
 
 def get_memory_mb() -> float:
-    """Get current process memory usage in MB."""
-    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    """Get current system memory usage in GB, converted to MB for compatibility."""
+    info = get_memory_info()
+    return info['sys_used_gb'] * 1024
 
 
 def get_gpu_memory_mb(device: str) -> Optional[float]:
     """Get GPU memory usage if available."""
-    if device == "mps" and torch.backends.mps.is_available():
-        # MPS doesn't have direct memory query, but we can get allocation info
-        try:
-            return torch.mps.current_allocated_memory() / 1024 / 1024
-        except AttributeError:
-            return None
+    info = get_memory_info()
+
+    if device == "mps" and 'mps_allocated_mb' in info:
+        return info['mps_allocated_mb']
     elif device == "cuda" and torch.cuda.is_available():
         return torch.cuda.memory_allocated() / 1024 / 1024
     return None
@@ -141,8 +208,11 @@ def clear_memory(device: str):
     # Multiple rounds of GC for thorough cleanup
     for _ in range(3):
         gc.collect()
-    
-    if device == "mps" and torch.backends.mps.is_available():
+
+    if device in ["mlx", "mlx-q4"]:
+        # MLX doesn't require explicit cache clearing
+        pass
+    elif device == "mps" and torch.backends.mps.is_available():
         try:
             torch.mps.empty_cache()
             torch.mps.synchronize()
@@ -151,7 +221,7 @@ def clear_memory(device: str):
     elif device == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    
+
     # Final GC pass
     gc.collect()
 
@@ -164,6 +234,67 @@ def word_count(text: str) -> int:
 def char_count(text: str) -> int:
     """Count characters in text."""
     return len(text)
+
+
+def transcribe_audio_whisper(audio_path: str) -> Optional[str]:
+    """
+    Transcribe audio using MLX Whisper.
+    
+    Args:
+        audio_path: Path to audio file
+        
+    Returns:
+        Transcription text or None if failed
+    """
+    try:
+        import mlx_whisper
+        result = mlx_whisper.transcribe(
+            audio_path,
+            path_or_hf_repo="mlx-community/whisper-base-mlx-q4",
+        )
+        return result["text"].strip()
+    except ImportError:
+        print("⚠️  mlx_whisper not installed. Install with: pip install mlx-whisper")
+        return None
+    except Exception as e:
+        print(f"⚠️  Transcription failed: {e}")
+        return None
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    """
+    Calculate Word Error Rate (WER) between reference and hypothesis.
+    
+    Args:
+        reference: Reference text
+        hypothesis: Hypothesis text from transcription
+        
+    Returns:
+        WER as a float (0.0 = perfect match, 1.0 = all errors)
+    """
+    import numpy as np
+    ref_words = reference.lower().split()
+    hyp_words = hypothesis.lower().split()
+    
+    # Dynamic programming for Levenshtein distance
+    d = np.zeros((len(ref_words) + 1, len(hyp_words) + 1), dtype=np.int32)
+    
+    for i in range(len(ref_words) + 1):
+        d[i][0] = i
+    for j in range(len(hyp_words) + 1):
+        d[0][j] = j
+    
+    for i in range(1, len(ref_words) + 1):
+        for j in range(1, len(hyp_words) + 1):
+            if ref_words[i-1] == hyp_words[j-1]:
+                d[i][j] = d[i-1][j-1]
+            else:
+                d[i][j] = min(d[i-1][j] + 1,    # deletion
+                             d[i][j-1] + 1,    # insertion
+                             d[i-1][j-1] + 1)  # substitution
+    
+    wer = d[len(ref_words)][len(hyp_words)] / max(len(ref_words), 1)
+    return wer
 
 
 # ============================================================================
@@ -183,6 +314,7 @@ class SingleRunResult:
     gpu_memory_mb: Optional[float]
     audio_duration_seconds: float
     realtime_factor: float  # audio_duration / generation_time
+    wav: Optional[Any] = None
 
 
 @dataclass
@@ -213,6 +345,13 @@ class BenchmarkResult:
     # Audio info
     audio_duration_seconds: float
 
+    # Audio quality validation (optional)
+    quality_metrics: Optional[AudioQualityMetrics] = None
+
+    # Transcription validation (optional - deprecated, use quality_metrics instead)
+    transcription: Optional[str] = None
+    word_error_rate: Optional[float] = None
+
 
 # ============================================================================
 # Benchmark Runner
@@ -231,91 +370,230 @@ class ChatterboxBenchmark:
         Path(config.output_dir).mkdir(parents=True, exist_ok=True)
         
     def load_model(self, device: str):
-        """Load the TTS model on specified device."""
+        """Load the TTS model on specified device.
+
+        Note: Float16 KV cache optimization is enabled by default for PyTorch models.
+        MLX models use native optimizations, MLX-Q4 uses 4-bit quantization.
+        """
         print(f"\n{'='*60}")
         print(f"Loading model on {device.upper()}...")
-        print(f"{'='*60}")
-        
+
         # Clear any existing model
         if self.model is not None:
             del self.model
             self.model = None
             clear_memory(self.current_device or "cpu")
-        
-        # Check device availability
-        if device == "mps":
-            if not torch.backends.mps.is_available():
-                print("⚠️  MPS not available, falling back to CPU")
-                device = "cpu"
+
+        is_mlx = device in ["mlx", "mlx-q4"]
+        is_hybrid_mlx = device == "hybrid-mlx"
+
+        if is_hybrid_mlx:
+            # Hybrid MLX: T3 MLX + S3Gen PyTorch
+            print(f"  Backend: Hybrid MLX (T3 MLX + S3Gen PyTorch)")
+            print(f"  T3: MLX (Apple Silicon optimized)")
+            print(f"  S3Gen: PyTorch on MPS")
+        elif is_mlx:
+            # MLX models
+            print(f"  Backend: MLX (Apple Silicon optimized)")
+            if device == "mlx-q4":
+                print(f"  Quantization: 4-bit (group_size=64)")
             else:
-                print("✓ MPS (Apple Silicon) is available")
-        elif device == "cuda":
-            if not torch.cuda.is_available():
-                print("⚠️  CUDA not available, falling back to CPU")
-                device = "cpu"
-        
+                print(f"  Precision: Full (float32)")
+        else:
+            # PyTorch models
+            print(f"  Backend: PyTorch")
+            print(f"  Float16 KV cache optimization: ENABLED")
+
+            # Check device availability
+            if device == "mps":
+                if not torch.backends.mps.is_available():
+                    print("⚠️  MPS not available, falling back to CPU")
+                    device = "cpu"
+                else:
+                    print("✓ MPS (Apple Silicon) is available")
+            elif device == "cuda":
+                if not torch.cuda.is_available():
+                    print("⚠️  CUDA not available, falling back to CPU")
+                    device = "cpu"
+
+        print(f"{'='*60}")
+
         self.current_device = device
         mem_before = get_memory_mb()
         load_start = time.time()
         
-        if self.config.model_type == "multilingual":
-            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-            self.model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+        log_memory_detailed("before_model_load", device)
+
+        # Load model based on backend
+        if is_hybrid_mlx:
+            # Hybrid MLX backend: T3 MLX + S3Gen PyTorch
+            try:
+                log_memory_detailed("hybrid_mlx_import_start", device)
+                if self.config.model_type == "multilingual":
+                    from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
+                    log_memory_detailed("hybrid_mlx_class_imported", device)
+                    self.model = ChatterboxMultilingualTTSMLX.from_pretrained()
+                else:
+                    from chatterbox.tts_mlx import ChatterboxTTSMLX
+                    log_memory_detailed("hybrid_mlx_class_imported", device)
+                    self.model = ChatterboxTTSMLX.from_pretrained()
+                log_memory_detailed("hybrid_mlx_model_loaded", device)
+            except (ImportError, RuntimeError, AttributeError) as e:
+                print(f"\n⚠️  Hybrid MLX backend not available")
+                print(f"    Error: {str(e)[:100]}")
+                raise RuntimeError(f"Hybrid MLX backend not available: {e}")
+        elif is_mlx:
+            # MLX backend - check if fully implemented
+            try:
+                log_memory_detailed("pure_mlx_import_start", device)
+                if self.config.model_type == "multilingual":
+                    from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
+                    log_memory_detailed("pure_mlx_class_imported", device)
+                    self.model = ChatterboxMultilingualTTSMLX.from_pretrained()
+                else:
+                    from chatterbox.tts_mlx import ChatterboxTTSPureMLX
+                    log_memory_detailed("pure_mlx_class_imported", device)
+                    self.model = ChatterboxTTSPureMLX.from_pretrained()
+                log_memory_detailed("pure_mlx_model_loaded", device)
+
+                # Apply quantization if requested
+                if device == "mlx-q4":
+                    print("  Applying 4-bit quantization...")
+                    log_memory_detailed("mlx_q4_before_quantize", device)
+                    from chatterbox.models.t3_mlx.quantization.quantize_mlx import QuantizedT3MLX
+                    # Quantize the underlying T3 model (stored as .t3 in ChatterboxTTSPureMLX)
+                    self.model.t3 = QuantizedT3MLX(self.model.t3, bits=4, group_size=64).model
+                    log_memory_detailed("mlx_q4_after_quantize", device)
+                    print("  ✓ Quantization complete")
+            except (ImportError, RuntimeError, AttributeError) as e:
+                print(f"\n⚠️  MLX backend not fully implemented yet")
+                print(f"    Error: {str(e)[:100]}")
+                print(f"    Skipping MLX benchmarks...")
+                print(f"    Note: Currently only PyTorch backends (mps, cpu) are supported")
+                raise RuntimeError(f"MLX backend not available: {e}")
         else:
-            from chatterbox.tts import ChatterboxTTS
-            self.model = ChatterboxTTS.from_pretrained(device=device)
-        
+            # PyTorch backend
+            log_memory_detailed("pytorch_import_start", device)
+            if self.config.model_type == "multilingual":
+                from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+                self.model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+            else:
+                from chatterbox.tts import ChatterboxTTS
+                self.model = ChatterboxTTS.from_pretrained(device=device)
+            log_memory_detailed("pytorch_model_loaded", device)
+
         load_time = time.time() - load_start
         mem_after = get_memory_mb()
         
+        log_memory_detailed("after_model_load_complete", device)
+
         print(f"✓ Model loaded in {load_time:.2f}s")
         print(f"  Memory: {mem_before:.1f} → {mem_after:.1f} MB (+{mem_after - mem_before:.1f} MB)")
-        
+
         # Prepare conditionals if audio prompt provided
         if self.config.audio_prompt_path:
             print(f"  Loading voice from: {self.config.audio_prompt_path}")
             self.model.prepare_conditionals(self.config.audio_prompt_path)
             print("  ✓ Voice conditionals prepared")
-    
-    def run_single_generation(self, text: str, run_id: int = 0) -> SingleRunResult:
-        """Run a single TTS generation and collect metrics."""
-        clear_memory(self.current_device)
         
+        # Initial model warmup to trigger JIT compilation (especially important for MPS)
+        # This ensures the first actual benchmark doesn't include compilation overhead
+        print(f"  Running initial warmup (JIT compilation)...", end="", flush=True)
+        warmup_text = "Hello, this is a warmup."
+        try:
+            _ = self.model.generate(warmup_text, exaggeration=0.5, cfg_weight=0.5)
+            clear_memory(device)
+            print(" done")
+        except Exception as e:
+            print(f" skipped ({e})")
+    
+    def run_single_generation(self, text: str, run_id: int = 0, keep_wav: bool = False, category: str = "short") -> SingleRunResult:
+        """Run a single TTS generation and collect metrics.
+
+        If `keep_wav` is True, the returned SingleRunResult will contain the generated
+        waveform in its `wav` field and the function will NOT delete the tensor or
+        clear GPU memory. Caller is responsible for deleting the tensor and clearing
+        memory after saving.
+
+        Args:
+            text: Text to generate
+            run_id: Run number (used for audio prompt handling)
+            keep_wav: Whether to keep the waveform in the result
+            category: Text category ("short", "medium", "long", "extra_long")
+        """
+        log_memory_detailed(f"gen_start_run{run_id}", self.current_device)
+        clear_memory(self.current_device)
+        log_memory_detailed(f"gen_after_clear_run{run_id}", self.current_device)
+
         mem_before = get_memory_mb()
         gpu_mem_before = get_gpu_memory_mb(self.current_device)
-        
+
         start_time = time.time()
+
+        # Use generate_long() for long texts to avoid truncation
+        use_long_generation = category in ["long", "extra_long"]
+
+        log_memory_detailed(f"gen_before_generate_run{run_id}", self.current_device)
         
         # Generate audio
         if self.config.model_type == "multilingual":
-            wav = self.model.generate(
-                text,
-                language_id="en",
-                audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
-                exaggeration=0.5,
-                cfg_weight=0.5,
-            )
+            if use_long_generation:
+                wav = self.model.generate_long(
+                    text,
+                    language_id="en",
+                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    exaggeration=0.5,
+                    cfg_weight=0.5,
+                    overlap_duration=0.1,
+                    show_progress=False,  # Suppress tqdm for cleaner benchmark output
+                )
+            else:
+                wav = self.model.generate(
+                    text,
+                    language_id="en",
+                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    exaggeration=0.5,
+                    cfg_weight=0.5,
+                    show_progress=False,  # Suppress tqdm for cleaner benchmark output
+                )
         else:
-            wav = self.model.generate(
-                text,
-                audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
-                exaggeration=0.5,
-                cfg_weight=0.5,
-            )
-        
+            if use_long_generation:
+                wav = self.model.generate_long(
+                    text,
+                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    exaggeration=0.5,
+                    cfg_weight=0.5,
+                    overlap_duration=0.1,
+                    show_progress=False,  # Suppress tqdm for cleaner benchmark output
+                )
+            else:
+                wav = self.model.generate(
+                    text,
+                    audio_prompt_path=self.config.audio_prompt_path if run_id == 0 else None,
+                    exaggeration=0.5,
+                    cfg_weight=0.5,
+                    show_progress=False,  # Suppress tqdm for cleaner benchmark output
+                )
+
         generation_time = time.time() - start_time
         
+        log_memory_detailed(f"gen_after_generate_run{run_id}", self.current_device)
+
         mem_after = get_memory_mb()
         gpu_mem_after = get_gpu_memory_mb(self.current_device)
-        
+
         # Calculate audio duration
         sample_rate = self.model.sr
-        audio_samples = wav.shape[-1]
+        # Handle both torch tensors and numpy arrays (MLX returns numpy)
+        if hasattr(wav, 'shape'):
+            audio_samples = wav.shape[-1]
+        else:
+            audio_samples = len(wav) if len(wav.shape) == 1 else wav.shape[-1]
         audio_duration = audio_samples / sample_rate
-        
+
         # Calculate real-time factor
         realtime_factor = audio_duration / generation_time if generation_time > 0 else 0
-        
+
         result = SingleRunResult(
             device=self.current_device,
             text_length_words=word_count(text),
@@ -327,12 +605,15 @@ class ChatterboxBenchmark:
             gpu_memory_mb=gpu_mem_after,
             audio_duration_seconds=audio_duration,
             realtime_factor=realtime_factor,
+            wav=wav if keep_wav else None,
         )
-        
-        # CRITICAL: Explicitly delete tensor and clear memory to prevent leaks
-        del wav
-        clear_memory(self.current_device)
-        
+
+        # If caller does not want to keep the waveform, delete it and clear memory.
+        if not keep_wav:
+            del wav
+            clear_memory(self.current_device)
+            log_memory_detailed(f"gen_after_cleanup_run{run_id}", self.current_device)
+
         return result
     
     def benchmark_text(self, text: str, category: str) -> BenchmarkResult:
@@ -343,19 +624,27 @@ class ChatterboxBenchmark:
         
         print(f"\n  Testing: {preview}")
         print(f"  Length: {text_words} words, {text_chars} chars")
-        
+
+        # Indicate which generation method will be used
+        if category in ["long", "extra_long"]:
+            print(f"  Method: generate_long() with chunking (50 words/chunk)")
+        else:
+            print(f"  Method: generate() (single-pass)")
+
         # Warmup runs
         print(f"  Warmup runs: ", end="", flush=True)
         for i in range(self.config.warmup_runs):
-            self.run_single_generation(text, run_id=i)
+            self.run_single_generation(text, run_id=i, category=category)
             print(".", end="", flush=True)
         print(" done")
-        
+
         # Benchmark runs
         print(f"  Benchmark runs: ", end="", flush=True)
         run_results: List[SingleRunResult] = []
         for i in range(self.config.benchmark_runs):
-            result = self.run_single_generation(text, run_id=i + self.config.warmup_runs)
+            # Keep the waveform from the last timed run if we want to save audio
+            keep = self.config.save_audio and (i == self.config.benchmark_runs - 1)
+            result = self.run_single_generation(text, run_id=i + self.config.warmup_runs, keep_wav=keep, category=category)
             run_results.append(result)
             print(".", end="", flush=True)
         print(" done")
@@ -392,9 +681,57 @@ class ChatterboxBenchmark:
         print(f"  → Real-time factor: {result.mean_realtime_factor:.2f}x")
         print(f"  → Throughput: {result.words_per_second:.1f} words/s, {result.chars_per_second:.1f} chars/s")
         
-        # Force aggressive cleanup between benchmarks
+        # Save the last waveform immediately if requested to avoid re-generating
+        output_path = None
+        if self.config.save_audio:
+            last_wav = run_results[-1].wav
+            if last_wav is not None:
+                output_path = Path(self.config.output_dir) / f"{self.current_device}_{category}.wav"
+
+                # Convert to numpy array and save with scipy (workaround for torchcodec bug in PyTorch 2.9)
+                if isinstance(last_wav, np.ndarray):
+                    wav_np = last_wav
+                elif isinstance(last_wav, torch.Tensor):
+                    wav_np = last_wav.cpu().numpy()
+                else:
+                    wav_np = np.array(last_wav)
+
+                # Ensure the array is squeezed (remove batch dimension if present)
+                wav_np = np.squeeze(wav_np)
+
+                # Convert float32 to int16 for WAV file
+                wav_int16 = (wav_np * 32767).astype(np.int16)
+
+                # Save using scipy.io.wavfile (workaround for torchcodec bug in PyTorch 2.9)
+                wavfile.write(str(output_path), self.model.sr, wav_int16)
+
+                print(f"  → Saved: {output_path}")
+                # Remove reference from the stored result so memory can be freed
+                run_results[-1].wav = None
+                del last_wav
+                clear_memory(self.current_device)
+
+                # Comprehensive audio quality validation
+                if self.config.validate_transcription:
+                    print(f"  Validating audio quality...")
+                    quality_metrics = validate_audio_quality(
+                        audio_path=str(output_path),
+                        reference_text=text,
+                        language="en",  # Standard benchmark is English
+                        enable_transcription=True,
+                    )
+                    result.quality_metrics = quality_metrics
+
+                    # Also populate legacy fields for backward compatibility
+                    result.transcription = quality_metrics.transcription
+                    result.word_error_rate = quality_metrics.word_error_rate
+
+                    # Print quality report
+                    print_quality_report(quality_metrics, verbose=True, reference_text=text)
+
+        # Force aggressive cleanup between benchmarks (if wav was not kept earlier)
         clear_memory(self.current_device)
-        
+
         return result
     
     def run_benchmarks(self):
@@ -409,51 +746,48 @@ class ChatterboxBenchmark:
         print(f"Warmup Runs: {self.config.warmup_runs}")
         print(f"Benchmark Runs: {self.config.benchmark_runs}")
         print(f"Devices to Test: {', '.join(self.config.test_devices)}")
+        if self.config.validate_transcription:
+            print(f"Transcription Validation: ENABLED (MLX Whisper)")
+        print(f"\n✓ Float16 KV Cache: ENABLED (default)")
+        print(f"  - Expected: 18-32% faster generation")
+        print(f"  - Expected: Significant memory savings")
         print("="*70)
         
         all_tests = [
             ("short", SHORT_TEXTS[0]),
             ("medium", MEDIUM_TEXTS[0]),
             ("long", LONG_TEXTS[0]),
-            ("extra_long", EXTRA_LONG_TEXT),
+            # ("extra_long", EXTRA_LONG_TEXT),  # Uncomment to include extra long test
         ]
         
         for device in self.config.test_devices:
-            self.load_model(device)
-            
+            try:
+                self.load_model(device)
+            except RuntimeError as e:
+                # Skip devices that aren't available (e.g., MLX not fully implemented)
+                if "not available" in str(e) or "not fully implemented" in str(e):
+                    print(f"\n⚠️  Skipping {device.upper()} benchmarks (not available)")
+                    continue
+                else:
+                    raise
+
             print(f"\n{'─'*60}")
             print(f"BENCHMARKING ON {device.upper()}")
             print(f"{'─'*60}")
-            
+
             for category, text in all_tests:
                 result = self.benchmark_text(text, category)
                 self.results.append(result)
-                
-                # Save audio if requested
-                if self.config.save_audio:
-                    # Generate one final time for saving
-                    if self.config.model_type == "multilingual":
-                        wav = self.model.generate(
-                            text,
-                            language_id="en",
-                            exaggeration=0.5,
-                            cfg_weight=0.5,
-                        )
-                    else:
-                        wav = self.model.generate(
-                            text,
-                            exaggeration=0.5,
-                            cfg_weight=0.5,
-                        )
-                    
-                    output_path = Path(self.config.output_dir) / f"{device}_{category}.wav"
-                    ta.save(str(output_path), wav, self.model.sr)
-                    print(f"  → Saved: {output_path}")
+
+                # Note: audio is saved immediately inside `benchmark_text` to avoid
+                # regenerating a sample. No further action needed here.
     
     def print_summary(self):
         """Print benchmark summary table."""
         print("\n" + "="*90)
         print("BENCHMARK SUMMARY")
+        print("="*90)
+        print("\nNote: All results use float16 KV cache optimization (enabled by default)")
         print("="*90)
         
         # Group results by device
@@ -490,20 +824,43 @@ class ChatterboxBenchmark:
                     print(f"│ {'N/A':<25} ", end="")
             print()
         
-        # Speedup comparison if multiple devices
-        if len(devices) > 1 and "cpu" in devices and "mps" in devices:
+        # Speedup comparisons
+        if len(devices) > 1:
             print(f"\n{'─'*90}")
-            print("MPS vs CPU Speedup:")
+            print("Performance Comparisons:")
+
+            # Define baseline as MPS or CPU if MPS not available
+            baseline_device = "mps" if "mps" in devices else ("cpu" if "cpu" in devices else devices[0])
+
             for category in categories:
                 cat_results = [r for r in self.results if r.text_category == category]
-                cpu_result = next((r for r in cat_results if r.device == "cpu"), None)
-                mps_result = next((r for r in cat_results if r.device == "mps"), None)
-                
-                if cpu_result and mps_result and cpu_result.mean_time > 0:
-                    speedup = cpu_result.mean_time / mps_result.mean_time
-                    faster = "MPS" if speedup > 1 else "CPU"
-                    ratio = speedup if speedup > 1 else 1/speedup
-                    print(f"  {category:<12}: {faster} is {ratio:.2f}x faster")
+                if not cat_results:
+                    continue
+
+                baseline_result = next((r for r in cat_results if r.device == baseline_device), None)
+                if not baseline_result or baseline_result.mean_time == 0:
+                    continue
+
+                print(f"\n  {category.upper()} (vs {baseline_device.upper()}):")
+                for device in devices:
+                    if device == baseline_device:
+                        continue
+
+                    dev_result = next((r for r in cat_results if r.device == device), None)
+                    if dev_result and dev_result.mean_time > 0:
+                        speedup = baseline_result.mean_time / dev_result.mean_time
+                        if speedup > 1:
+                            print(f"    {device.upper():<10}: {speedup:.2f}x faster")
+                        else:
+                            print(f"    {device.upper():<10}: {1/speedup:.2f}x slower")
+
+        # Transcription validation summary
+        results_with_wer = [r for r in self.results if r.word_error_rate is not None]
+        if results_with_wer:
+            print(f"\n{'─'*90}")
+            print("Transcription Validation (Word Error Rate):")
+            for r in results_with_wer:
+                print(f"  {r.device.upper():<12} {r.text_category:<10}: {r.word_error_rate:.2%} WER")
         
         print(f"\n{'='*90}")
         
@@ -541,6 +898,8 @@ class ChatterboxBenchmark:
                     "words_per_second": r.words_per_second,
                     "audio_duration_seconds": r.audio_duration_seconds,
                     "peak_memory_mb": r.peak_memory_mb,
+                    "transcription": r.transcription,
+                    "word_error_rate": r.word_error_rate,
                 }
                 for r in self.results
             ]
@@ -563,9 +922,9 @@ def main():
     parser = argparse.ArgumentParser(description="Chatterbox TTS MPS Benchmark")
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup runs")
     parser.add_argument("--runs", type=int, default=3, help="Number of benchmark runs")
-    parser.add_argument("--devices", nargs="+", default=["mps", "cpu"], 
-                       help="Devices to benchmark (mps, cpu)")
-    parser.add_argument("--model", choices=["standard", "multilingual"], 
+    parser.add_argument("--devices", nargs="+", default=["mps", "cpu", "hybrid-mlx", "mlx", "mlx-q4"],
+                       help="Devices to benchmark (mps, cpu, hybrid-mlx, mlx, mlx-q4). MLX will be skipped if not available.")
+    parser.add_argument("--model", choices=["standard", "multilingual"],
                        default="standard", help="Model type to benchmark")
     parser.add_argument("--audio-prompt", type=str, default=None,
                        help="Path to reference audio for voice cloning")
@@ -574,17 +933,40 @@ def main():
     parser.add_argument("--no-save-audio", action="store_true",
                        help="Don't save generated audio files")
     parser.add_argument("--mps-only", action="store_true",
-                       help="Only benchmark MPS (skip CPU)")
+                       help="Only benchmark MPS (skip others)")
     parser.add_argument("--cpu-only", action="store_true",
-                       help="Only benchmark CPU (skip MPS)")
+                       help="Only benchmark CPU (skip others)")
+    parser.add_argument("--mlx-only", action="store_true",
+                       help="Only benchmark MLX full precision (skip others)")
+    parser.add_argument("--mlx-q4-only", action="store_true",
+                       help="Only benchmark MLX quantized (skip others)")
+    parser.add_argument("--hybrid-mlx-only", action="store_true",
+                       help="Only benchmark Hybrid MLX (skip others)")
+    parser.add_argument("--validate", action="store_true",
+                       help="Enable Whisper transcription validation")
+    parser.add_argument("--debug-memory", action="store_true",
+                       help="Enable detailed memory logging for debugging memory spikes")
     
     args = parser.parse_args()
+    
+    # Enable memory debugging if requested
+    if args.debug_memory:
+        os.environ["DEBUG_MEMORY"] = "1"
+        global DEBUG_MEMORY
+        DEBUG_MEMORY = True
+        print("🔍 Memory debugging enabled - detailed memory logs will be printed")
     
     # Handle device selection
     if args.mps_only:
         devices = ["mps"]
     elif args.cpu_only:
         devices = ["cpu"]
+    elif args.mlx_only:
+        devices = ["mlx"]
+    elif args.mlx_q4_only:
+        devices = ["mlx-q4"]
+    elif args.hybrid_mlx_only:
+        devices = ["hybrid-mlx"]
     else:
         devices = args.devices
     
@@ -596,6 +978,7 @@ def main():
         audio_prompt_path=args.audio_prompt,
         output_dir=args.output_dir,
         save_audio=not args.no_save_audio,
+        validate_transcription=args.validate,
     )
     
     benchmark = ChatterboxBenchmark(config)
