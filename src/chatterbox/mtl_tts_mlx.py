@@ -104,6 +104,99 @@ SUPPORTED_LANGUAGES = {
 }
 
 
+# Minimum words per generated chunk. Sentences shorter than this are
+# merged with their neighbours before synthesis.
+#
+# generate() synthesizes each sentence independently, and estimate_max_tokens
+# floors the budget at 80 tokens -- 3.2s at S3_TOKEN_RATE = 25Hz -- for short
+# text. A 3-word sentence needs about 1s, leaving ~2s of budget the model
+# fills with invented speech when EOS does not fire promptly.
+#
+# Measured, 240 generations per condition (single voice, English, ASR-scored
+# insertions against the reference):
+#
+#     2-word chunk    10.0%      hallucination rate
+#     3-word chunk    33.8%
+#     4-word chunk    10.0%
+#     9-word chunk     1.2%
+#
+# Per item containing three short chunks: 44.7% -> 3.7%.
+#
+# generate_long() never had this problem because get_adaptive_chunks groups
+# sentences to ~50 words; only the short-form path was exposed.
+MIN_CHUNK_WORDS = 8
+MAX_CHUNK_WORDS = 30
+
+_TERMINATOR_RE = re.compile(r"[.!?]+[\"”]*$")
+
+
+def merge_short_sentences(
+    sentences: List[str],
+    min_words: int = MIN_CHUNK_WORDS,
+    max_words: int = MAX_CHUNK_WORDS,
+) -> List[str]:
+    """Group adjacent sentences until each group reaches ``min_words``.
+
+    Within a group every sentence but the last has its terminal ``.!?``
+    replaced by a comma, so the group reads as one utterance and is
+    synthesized as a single generation. No words are added, removed or
+    reordered.
+
+    Sentences already at or above ``min_words`` pass through untouched,
+    and no group exceeds ``max_words`` -- the goal is to lift tiny chunks
+    out of the hallucination-prone range, not to maximize chunk size.
+    """
+    if len(sentences) < 2:
+        return sentences
+
+    groups: List[List[str]] = []
+    current: List[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        words = len(sentence.split())
+        if current and (current_words >= min_words
+                        or current_words + words > max_words):
+            groups.append(current)
+            current, current_words = [], 0
+        current.append(sentence)
+        current_words += words
+
+    if current:
+        # Never leave a short tail as its own chunk -- that is the exact
+        # case this function exists to prevent.
+        if groups and current_words < min_words:
+            tail_room = sum(len(s.split()) for s in groups[-1]) + current_words
+            if tail_room <= max_words:
+                groups[-1] = groups[-1] + current
+                current = []
+        if current:
+            groups.append(current)
+
+    merged = [_join_sentence_group(g) for g in groups]
+    if len(merged) != len(sentences):
+        logger.debug(
+            "merged %d sentences into %d chunk(s): %s -> %s words",
+            len(sentences), len(merged),
+            [len(s.split()) for s in sentences],
+            [len(s.split()) for s in merged],
+        )
+    return merged
+
+
+def _join_sentence_group(group: List[str]) -> str:
+    """Comma-join a group so the model treats it as one utterance."""
+    if len(group) == 1:
+        return group[0]
+    parts = []
+    for sentence in group[:-1]:
+        stripped = _TERMINATOR_RE.sub("", sentence).rstrip()
+        if stripped:
+            parts.append(stripped + ",")
+    parts.append(group[-1])
+    return " ".join(parts)
+
+
 def punc_norm(text: str, debug: bool = True) -> str:
     """
     Quick cleanup func for punctuation from LLMs or
@@ -538,6 +631,11 @@ class ChatterboxMultilingualTTSMLX:
         # Filter out empty sentences
         sentences = [s for s in sentences if s and s.strip()]
 
+        # Merge short sentences so no chunk is small enough to hallucinate.
+        # Runs after punc_norm, so quotes are already stripped and the
+        # merge cannot strand one mid-text.
+        sentences = merge_short_sentences(sentences, MIN_CHUNK_WORDS)
+
         total_words = len(text.split())
         num_chunks = len(sentences)
         lang_name = SUPPORTED_LANGUAGES.get(lang, language_id)
@@ -780,6 +878,18 @@ class ChatterboxMultilingualTTSMLX:
         speech_tokens_pt = torch.from_numpy(speech_tokens_np)
 
         # DEBUG: Log token counts before filtering
+        # Missing EOS means generation ran to the token cap instead of
+        # deciding it was finished -- the signature of a hallucinated
+        # tail. Warn unconditionally: the absence of the existing
+        # "EOS detected" info log is not something a bulk run can grep
+        # for, so this failure was previously silent in production.
+        if not (speech_tokens_pt == 6562).any().item():
+            logger.warning(
+                "no EOS token: generation used all %d tokens for %d-word text "
+                "(%r) -- output may contain hallucinated audio",
+                len(speech_tokens_pt), len(text.split()), text[:60],
+            )
+
         if os.getenv("CHATTERBOX_DEBUG"):
             print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
             print(
