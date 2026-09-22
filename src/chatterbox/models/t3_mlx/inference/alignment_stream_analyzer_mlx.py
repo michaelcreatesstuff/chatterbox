@@ -224,9 +224,7 @@ class AlignmentStreamAnalyzerMLX:
                 self.collapsed_frames += 1
             else:
                 self.collapsed_frames = 0
-            attention_collapse = (
-                self.collapsed_frames >= TEXT_ATTENTION_COLLAPSE_FRAMES
-            )
+            attention_collapse = self.collapsed_frames >= TEXT_ATTENTION_COLLAPSE_FRAMES
 
         # Track token repetition
         if next_token is not None:

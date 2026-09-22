@@ -155,8 +155,9 @@ def merge_short_sentences(
 
     for sentence in sentences:
         words = len(sentence.split())
-        if current and (current_words >= min_words
-                        or current_words + words > max_words):
+        if current and (
+            current_words >= min_words or current_words + words > max_words
+        ):
             groups.append(current)
             current, current_words = [], 0
         current.append(sentence)
@@ -177,7 +178,8 @@ def merge_short_sentences(
     if len(merged) != len(sentences):
         logger.debug(
             "merged %d sentences into %d chunk(s): %s -> %s words",
-            len(sentences), len(merged),
+            len(sentences),
+            len(merged),
             [len(s.split()) for s in sentences],
             [len(s.split()) for s in merged],
         )
@@ -887,7 +889,9 @@ class ChatterboxMultilingualTTSMLX:
             logger.warning(
                 "no EOS token: generation used all %d tokens for %d-word text "
                 "(%r) -- output may contain hallucinated audio",
-                len(speech_tokens_pt), len(text.split()), text[:60],
+                len(speech_tokens_pt),
+                len(text.split()),
+                text[:60],
             )
 
         if os.getenv("CHATTERBOX_DEBUG"):
