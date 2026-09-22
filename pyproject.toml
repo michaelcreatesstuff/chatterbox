@@ -29,6 +29,7 @@ dependencies = [
     "transformers>=5.10.0",
     "diffusers==0.35.2",
     "resemble-perth==1.0.1",
+    "setuptools<82",  # resemble-perth imports pkg_resources, removed in setuptools 82
     "conformer==0.3.2",
     "safetensors>=0.7.0",
     "huggingface-hub>=0.20.0",
