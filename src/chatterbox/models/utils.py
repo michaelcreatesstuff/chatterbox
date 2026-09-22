@@ -1,6 +1,7 @@
 from os import environ
 import gc
 import logging
+import threading
 import torch
 from torch import bfloat16, float16, float32, cuda, backends, mps
 from psutil import virtual_memory
@@ -134,14 +135,23 @@ def contiguous_view(tensor: torch.Tensor, *shape: int) -> torch.Tensor:
     return ensure_contiguous(tensor).view(*shape)
 
 
+# PyTorch's MPS backend is not thread-safe: two threads driving it at once abort
+# inside Metal ("Scheduled handler provided after commit call"). MLX is (streams
+# are per-thread), so the MLX pipelines hold this lock only around their PyTorch
+# work (S3Gen, voice encoder, conditioning, tensor moves) and never around T3,
+# letting MLX generation on different threads overlap.
+TORCH_LOCK = threading.RLock()
+
+
 def clear_device_memory():
     """Clear GPU memory for both CUDA and MPS devices."""
     gc.collect()
-    if cuda.is_available():
-        cuda.empty_cache()
-    elif hasattr(backends, "mps") and backends.mps.is_available():
-        mps.empty_cache()
-        mps.synchronize()
+    with TORCH_LOCK:
+        if cuda.is_available():
+            cuda.empty_cache()
+        elif hasattr(backends, "mps") and backends.mps.is_available():
+            mps.empty_cache()
+            mps.synchronize()
 
 
 # =============================================================================
@@ -353,7 +363,8 @@ def get_memory_info():
     # MPS memory
     if hasattr(backends, "mps") and backends.mps.is_available():
         try:
-            mps.synchronize()
+            with TORCH_LOCK:
+                mps.synchronize()
             info["mps_allocated_mb"] = mps.current_allocated_memory() / 1024**2
             if hasattr(mps, "driver_allocated_memory"):
                 info["mps_driver_mb"] = mps.driver_allocated_memory() / 1024**2

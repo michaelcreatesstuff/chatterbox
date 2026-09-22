@@ -35,7 +35,7 @@ from .generation_utils import (
 )
 
 # Import memory utilities for debugging
-from .models.utils import get_memory_info, is_debug, materialize_mlx_state
+from .models.utils import TORCH_LOCK, get_memory_info, is_debug, materialize_mlx_state
 
 try:
     import mlx.core as mx
@@ -393,50 +393,54 @@ class ChatterboxTTSMLX:
             wav_fpath: Path to reference audio file
             exaggeration: Emotion exaggeration factor (0.0 to 1.0)
         """
-        from .tts import Conditionals
+        # PyTorch/MPS is not thread-safe; see TORCH_LOCK.
+        with TORCH_LOCK:
+            from .tts import Conditionals
 
-        # Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
-
-        s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
-
-        # Get S3Gen reference embedding (PyTorch)
-        s3gen_ref_dict = self.s3gen.embed_ref(
-            s3gen_ref_wav, S3GEN_SR, device=self.device
-        )
-
-        # Speech cond prompt tokens for T3
-        t3_cond_prompt_tokens = None
-        if hasattr(self.t3, "hp") and self.t3.hp.speech_cond_prompt_len:
-            plen = self.t3.hp.speech_cond_prompt_len
-            s3_tokzr = self.s3gen.tokenizer
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward(
-                [ref_16k_wav[: self.ENC_COND_LEN]], max_len=plen
-            )
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(
-                self.device
+            # Load reference wav
+            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+            ref_16k_wav = librosa.resample(
+                s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR
             )
 
-        # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(
-            self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
-        )
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+            s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
 
-        t3_cond = T3Cond(
-            speaker_emb=ve_embed,
-            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
-        ).to(device=self.device)
+            # Get S3Gen reference embedding (PyTorch)
+            s3gen_ref_dict = self.s3gen.embed_ref(
+                s3gen_ref_wav, S3GEN_SR, device=self.device
+            )
 
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+            # Speech cond prompt tokens for T3
+            t3_cond_prompt_tokens = None
+            if hasattr(self.t3, "hp") and self.t3.hp.speech_cond_prompt_len:
+                plen = self.t3.hp.speech_cond_prompt_len
+                s3_tokzr = self.s3gen.tokenizer
+                t3_cond_prompt_tokens, _ = s3_tokzr.forward(
+                    [ref_16k_wav[: self.ENC_COND_LEN]], max_len=plen
+                )
+                t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(
+                    self.device
+                )
 
-        # Clear conditioning cache when conditioning changes
-        self._cached_t3_cond_mx = None
-        self._cached_cond_hash = None
-        materialize_mlx_state(self.conds)
-        _log_memory_mlx("hybrid_conditionals_prepared")
+            # Voice-encoder speaker embedding
+            ve_embed = torch.from_numpy(
+                self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
+            )
+            ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+
+            t3_cond = T3Cond(
+                speaker_emb=ve_embed,
+                cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+            self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+
+            # Clear conditioning cache when conditioning changes
+            self._cached_t3_cond_mx = None
+            self._cached_cond_hash = None
+            materialize_mlx_state(self.conds)
+            _log_memory_mlx("hybrid_conditionals_prepared")
 
     def _generate_single_sentence(
         self,
@@ -473,35 +477,37 @@ class ChatterboxTTSMLX:
         # Normalize and tokenize text
         text = punc_norm(text)
 
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        # Torch work only; T3 below runs on MLX, outside the lock.
+        with TORCH_LOCK:
+            text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
 
-        # Estimate reasonable max_new_tokens based on text length if not provided
-        # Speech tokens are roughly 10-15x text characters, with 2x safety buffer
-        # This prevents runaway generation when EOS is not triggered
-        if max_new_tokens is None:
-            estimated_tokens = len(text) * 15  # ~15 speech tokens per character
-            max_new_tokens = min(
-                max(estimated_tokens * 2, 200),  # At least 200, 2x buffer
-                self.t3.hp.max_speech_tokens,  # But never exceed model max
-            )
-            logger.debug(
-                f"Estimated max_new_tokens: {max_new_tokens} for {len(text)} chars"
-            )
+            # Estimate reasonable max_new_tokens based on text length if not provided
+            # Speech tokens are roughly 10-15x text characters, with 2x safety buffer
+            # This prevents runaway generation when EOS is not triggered
+            if max_new_tokens is None:
+                estimated_tokens = len(text) * 15  # ~15 speech tokens per character
+                max_new_tokens = min(
+                    max(estimated_tokens * 2, 200),  # At least 200, 2x buffer
+                    self.t3.hp.max_speech_tokens,  # But never exceed model max
+                )
+                logger.debug(
+                    f"Estimated max_new_tokens: {max_new_tokens} for {len(text)} chars"
+                )
 
-        # Add start/end tokens for CFG
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+            # Add start/end tokens for CFG
+            if cfg_weight > 0.0:
+                text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
 
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+            sot = self.t3.hp.start_text_token
+            eot = self.t3.hp.stop_text_token
+            text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+            text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
-        # Convert to MLX for T3 inference
-        text_tokens_mx = mx.array(text_tokens.cpu().numpy())
+            # Convert to MLX for T3 inference
+            text_tokens_mx = mx.array(text_tokens.cpu().numpy())
 
-        # Get cached T3 conditioning (avoids re-conversion for each sentence)
-        t3_cond_mx = self._get_cached_t3_cond_mx()
+            # Get cached T3 conditioning (avoids re-conversion for each sentence)
+            t3_cond_mx = self._get_cached_t3_cond_mx()
 
         _log_memory_mlx("hybrid_before_t3_inference")
 
@@ -532,27 +538,28 @@ class ChatterboxTTSMLX:
 
         # Convert back to PyTorch for S3Gen
         speech_tokens_np = np.array(speech_tokens).astype(np.int64)
-        speech_tokens_pt = torch.from_numpy(speech_tokens_np)
+        with TORCH_LOCK:
+            speech_tokens_pt = torch.from_numpy(speech_tokens_np)
 
-        # Drop invalid tokens (SOS/EOS) - needs PyTorch tensor
-        speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
+            # Drop invalid tokens (SOS/EOS) - needs PyTorch tensor
+            speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
 
-        # Filter out tokens >= 6561 (special tokens)
-        speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
-        speech_tokens_pt = speech_tokens_pt.to(self.device)
+            # Filter out tokens >= 6561 (special tokens)
+            speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
+            speech_tokens_pt = speech_tokens_pt.to(self.device)
 
-        _log_memory_mlx("hybrid_before_s3gen_inference")
+            _log_memory_mlx("hybrid_before_s3gen_inference")
 
-        # Generate waveform with S3Gen (PyTorch/MPS)
-        with torch.inference_mode():
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens_pt,
-                ref_dict=self.conds.gen,
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
+            # Generate waveform with S3Gen (PyTorch/MPS)
+            with torch.inference_mode():
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens_pt,
+                    ref_dict=self.conds.gen,
+                )
+                wav = wav.squeeze(0).detach().cpu().numpy()
 
-            if apply_watermark:
-                wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                if apply_watermark:
+                    wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
 
         _log_memory_mlx("hybrid_after_s3gen_inference")
 
@@ -609,13 +616,14 @@ class ChatterboxTTSMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        with TORCH_LOCK:
+            if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
 
         # Split text into sentences for optimal MLX performance
         if use_sentence_chunking and SPACY_AVAILABLE:
@@ -699,8 +707,9 @@ class ChatterboxTTSMLX:
             gc.collect()
 
             # Clear PyTorch MPS cache periodically (every 3 chunks)
-            if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            with TORCH_LOCK:
+                if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
         total_time = _time.time() - total_start
 
@@ -791,13 +800,14 @@ class ChatterboxTTSMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        with TORCH_LOCK:
+            if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
 
         # Split text into individual sentences using spacy
         if SPACY_AVAILABLE:
@@ -873,8 +883,9 @@ class ChatterboxTTSMLX:
             gc.collect()
 
             # Clear PyTorch MPS cache periodically (every 3 chunks)
-            if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            with TORCH_LOCK:
+                if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
         total_time = _time.time() - total_start
 
@@ -1424,13 +1435,14 @@ class ChatterboxTTSPureMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        with TORCH_LOCK:
+            if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
 
         # Split text into sentences for optimal performance
         if use_sentence_chunking and SPACY_AVAILABLE:
@@ -1519,8 +1531,9 @@ class ChatterboxTTSPureMLX:
             gc.collect()
 
             # Clear PyTorch MPS cache periodically (every 3 chunks)
-            if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            with TORCH_LOCK:
+                if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
         total_time = _time.time() - total_start
 
@@ -1613,13 +1626,14 @@ class ChatterboxTTSPureMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        with TORCH_LOCK:
+            if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
 
         # Split text into individual sentences using spacy
         if SPACY_AVAILABLE:
@@ -1699,8 +1713,9 @@ class ChatterboxTTSPureMLX:
             gc.collect()
 
             # Clear PyTorch MPS cache periodically (every 3 chunks)
-            if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            with TORCH_LOCK:
+                if i > 0 and i % 3 == 0 and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
         total_time = _time.time() - total_start
 
