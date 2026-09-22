@@ -12,7 +12,7 @@ This implementation uses a hybrid approach:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import TYPE_CHECKING, Optional, List
 import logging
 import re
 import os
@@ -63,8 +63,13 @@ from .models.t3_mlx.modules.cond_enc_mlx import T3CondMLX
 from .models.t3.modules.t3_config import T3Config
 from .models.t3.modules.cond_enc import T3Cond
 
-# Use PyTorch S3Gen for now (hybrid approach - T3 in MLX, S3Gen in PyTorch/MPS)
-from .models.s3gen import S3Gen, S3GEN_SR
+# Use PyTorch S3Gen for now (hybrid approach - T3 in MLX, S3Gen in PyTorch/MPS).
+# S3Gen itself is imported where it's constructed: its diffusers dependency
+# imports transformers, which the MLX path shouldn't pay for at import time.
+from .models.s3gen import S3GEN_SR
+
+if TYPE_CHECKING:
+    from .models.s3gen import S3Gen
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.voice_encoder import VoiceEncoder
 from .models.tokenizers import EnTokenizer
@@ -173,7 +178,7 @@ class ChatterboxTTSMLX:
     def __init__(
         self,
         t3: T3MLX,
-        s3gen: S3Gen,  # PyTorch S3Gen for now
+        s3gen: "S3Gen",  # PyTorch S3Gen for now
         ve: VoiceEncoder,
         tokenizer: EnTokenizer,
         device: str = "mps",
@@ -340,6 +345,8 @@ class ChatterboxTTSMLX:
 
         # Load S3Gen (PyTorch/MPS) - hybrid approach
         logger.info(f"Loading S3Gen vocoder (PyTorch on {device})...")
+        from .models.s3gen import S3Gen
+
         s3gen = S3Gen()
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
         s3gen.to(device).eval()
