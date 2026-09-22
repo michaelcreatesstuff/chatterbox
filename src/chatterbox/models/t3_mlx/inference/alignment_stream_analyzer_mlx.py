@@ -9,6 +9,7 @@ Monitors attention patterns to detect and prevent:
 - Alignment-based repetition (re-speaking earlier text)
 - Token repetition (same token repeated multiple times)
 - Premature EOS termination
+- Text-attention collapse (babbling after the text is finished)
 """
 
 import logging
@@ -21,6 +22,14 @@ logger = logging.getLogger(__name__)
 # Specific Llama attention heads that show text-speech alignment
 # Format: (layer_index, head_index)
 LLAMA_ALIGNED_HEADS = [(12, 15), (13, 11), (9, 2)]
+
+# Once the text is complete, force EOS after this many consecutive frames in
+# which no text token gets more than this much aligned attention. While the
+# model reads, the peak is ~0.3-0.5; when it starts babbling it stops attending
+# to the text at all (~0.01-0.05), which long_tail and alignment_repetition --
+# both sums of attention *on* the text -- take hundreds of frames to notice.
+TEXT_ATTENTION_COLLAPSE_THRESHOLD = 0.15
+TEXT_ATTENTION_COLLAPSE_FRAMES = 3
 
 
 @dataclass
@@ -82,6 +91,9 @@ class AlignmentStreamAnalyzerMLX:
         # Has generation completed all text tokens?
         self.complete = False
         self.completed_at: Optional[int] = None
+
+        # Consecutive post-completion frames with collapsed text attention
+        self.collapsed_frames = 0
 
         # Track recent generated tokens for repetition detection
         self.generated_tokens: List[int] = []
@@ -204,6 +216,18 @@ class AlignmentStreamAnalyzerMLX:
                     float(mx.sum(mx.max(past_attention, axis=1)).item()) > 5
                 )
 
+        # Detect text-attention collapse (model has stopped reading the text)
+        attention_collapse = False
+        if self.complete:
+            peak = float(mx.max(A_chunk[-1]).item())
+            if peak < TEXT_ATTENTION_COLLAPSE_THRESHOLD:
+                self.collapsed_frames += 1
+            else:
+                self.collapsed_frames = 0
+            attention_collapse = (
+                self.collapsed_frames >= TEXT_ATTENTION_COLLAPSE_FRAMES
+            )
+
         # Track token repetition
         if next_token is not None:
             self.generated_tokens.append(next_token)
@@ -263,9 +287,10 @@ class AlignmentStreamAnalyzerMLX:
             logits = mx.where(eos_mask[None, :], -32768.0, logits)
 
         # Force EOS if bad conditions detected
-        if long_tail or alignment_repetition or token_repetition:
+        if long_tail or alignment_repetition or token_repetition or attention_collapse:
             logger.debug(
-                f"Forcing EOS token: {long_tail=}, {alignment_repetition=}, {token_repetition=}"
+                f"Forcing EOS token: {long_tail=}, {alignment_repetition=}, "
+                f"{token_repetition=}, {attention_collapse=}"
             )
             # Set all logits to large negative
             vocab_size = logits.shape[-1]
@@ -287,6 +312,7 @@ class AlignmentStreamAnalyzerMLX:
         self.started_at = None
         self.complete = False
         self.completed_at = None
+        self.collapsed_frames = 0
         self.generated_tokens = []
         self.last_aligned_attns = [None] * len(LLAMA_ALIGNED_HEADS)
 
