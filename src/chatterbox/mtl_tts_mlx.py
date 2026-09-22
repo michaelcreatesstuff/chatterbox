@@ -28,10 +28,10 @@ try:
 except ImportError:
     MLX_AVAILABLE = False
     _mlx_import_error = (
-        "MLX is not installed. Install it with:\n"
-        "  pip install chatterbox-tts[mlx]\n"
+        "MLX is not installed (it requires Apple Silicon). Install it with:\n"
+        "  pip install chatterbox-mlx\n"
         "or manually:\n"
-        "  pip install mlx mlx-lm"
+        "  pip install 'mlx>=0.32.2'"
     )
 
 if not MLX_AVAILABLE:

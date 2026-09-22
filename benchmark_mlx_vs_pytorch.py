@@ -31,7 +31,7 @@ try:
     MLX_AVAILABLE = True
 except ImportError:
     MLX_AVAILABLE = False
-    logger.warning("⚠️  MLX not installed. Install with: pip install mlx mlx-lm")
+    logger.warning("⚠️  MLX not installed. Install with: pip install 'mlx>=0.32.2'")
     logger.warning("⚠️  MLX benchmarks will be skipped.")
 
 
