@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.voice_encoder import VoiceEncoder
 from .models.tokenizers import MTLTokenizer
-from .models.utils import clear_device_memory
+from .models.utils import clear_device_memory, materialize_mlx_state
 
 # Shared generation utilities
 from .generation_utils import (
@@ -354,6 +354,10 @@ class ChatterboxMultilingualTTSMLX:
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
 
+        # Evaluate lazily-built MLX state now, so the model can be used from
+        # threads other than the one that loaded it (MLX streams are per-thread).
+        materialize_mlx_state(self.t3, self.conds)
+
     @classmethod
     def get_supported_languages(cls) -> Dict[str, str]:
         """Return dictionary of supported language codes and names."""
@@ -558,6 +562,7 @@ class ChatterboxMultilingualTTSMLX:
         ).to(device=self.device)
 
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        materialize_mlx_state(self.conds)
 
     def generate(
         self,

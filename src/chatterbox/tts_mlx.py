@@ -35,7 +35,7 @@ from .generation_utils import (
 )
 
 # Import memory utilities for debugging
-from .models.utils import get_memory_info, is_debug
+from .models.utils import get_memory_info, is_debug, materialize_mlx_state
 
 try:
     import mlx.core as mx
@@ -208,6 +208,10 @@ class ChatterboxTTSMLX:
         self._cached_t3_cond_mx: Optional[T3CondMLX] = None
         self._cached_cond_hash: Optional[int] = None
 
+        # Evaluate lazily-built MLX state now, so the model can be used from
+        # threads other than the one that loaded it (MLX streams are per-thread).
+        materialize_mlx_state(self.t3, self.s3gen, self.conds)
+
     def _get_cached_t3_cond_mx(self) -> T3CondMLX:
         """
         Get cached MLX conditioning, converting from PyTorch only if changed.
@@ -241,6 +245,7 @@ class ChatterboxTTSMLX:
                 emotion_adv=float(self.conds.t3.emotion_adv[0, 0, 0].item()),
             )
             self._cached_cond_hash = cond_hash
+            materialize_mlx_state(self._cached_t3_cond_mx)
             logger.debug("Cached MLX conditioning updated")
 
         return self._cached_t3_cond_mx
@@ -430,6 +435,7 @@ class ChatterboxTTSMLX:
         # Clear conditioning cache when conditioning changes
         self._cached_t3_cond_mx = None
         self._cached_cond_hash = None
+        materialize_mlx_state(self.conds)
         _log_memory_mlx("hybrid_conditionals_prepared")
 
     def _generate_single_sentence(
@@ -944,6 +950,10 @@ class ChatterboxTTSPureMLX:
         self._cached_t3_cond_mx: Optional[T3CondMLX] = None
         self._cached_cond_hash: Optional[int] = None
 
+        # Evaluate lazily-built MLX state now, so the model can be used from
+        # threads other than the one that loaded it (MLX streams are per-thread).
+        materialize_mlx_state(self.t3, self.s3gen, self.conds)
+
     def _get_cached_t3_cond_mx(self) -> T3CondMLX:
         """Get or create cached MLX conditioning for T3.
 
@@ -989,6 +999,7 @@ class ChatterboxTTSPureMLX:
             emotion_adv=float(self.conds.t3.emotion_adv[0, 0, 0].item()),
         )
         self._cached_cond_hash = cond_hash
+        materialize_mlx_state(self._cached_t3_cond_mx)
 
         return self._cached_t3_cond_mx
 
@@ -1202,6 +1213,7 @@ class ChatterboxTTSPureMLX:
         # Clear conditioning cache when conditioning changes
         self._cached_t3_cond_mx = None
         self._cached_cond_hash = None
+        materialize_mlx_state(self.conds)
         _log_memory_mlx("pure_mlx_conditionals_prepared")
 
     def _generate_single_sentence(

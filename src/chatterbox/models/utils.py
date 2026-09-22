@@ -159,6 +159,43 @@ def _get_mlx():
         return None
 
 
+def materialize_mlx_state(*objs):
+    """Evaluate every MLX array reachable from ``objs`` on the calling thread.
+
+    Since MLX 0.31.2 each thread has its own default stream, and a lazy array
+    whose graph was built on one thread raises "There is no Stream(gpu, 0) in
+    current thread" when evaluated on another. Loading a model leaves such
+    graphs behind (random init of unloaded params, casts, rope tables), so call
+    this before a model or its cached conditioning can be used from another
+    thread. Walks MLX modules (including underscore attributes), dicts,
+    lists/tuples and chatterbox objects; PyTorch modules and tensors are skipped.
+    """
+    mx = _get_mlx()
+    if mx is None:
+        return
+    arrays, seen = [], set()
+    stack = list(objs)
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, mx.array):
+            arrays.append(obj)
+            continue
+        if isinstance(obj, (torch.Tensor, torch.nn.Module)):
+            continue
+        if isinstance(obj, dict):  # includes mlx.nn.Module, which is a dict
+            stack.extend(obj.values())
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        module = type(obj).__module__ or ""
+        if hasattr(obj, "__dict__") and module.startswith(("chatterbox.", "mlx.")):
+            stack.extend(vars(obj).values())
+    if arrays:
+        mx.eval(arrays)
+
+
 def set_mlx_cache_limit(limit_gb: float = 4.0):
     """
     Set MLX cache memory limit to prevent unbounded growth.
