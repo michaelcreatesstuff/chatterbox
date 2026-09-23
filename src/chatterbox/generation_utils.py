@@ -11,7 +11,9 @@ This module provides common functionality for:
 - Generation observability (progress logging)
 """
 
+from fractions import Fraction
 from typing import List
+import math
 import re
 import logging
 import subprocess
@@ -20,6 +22,59 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Word counting
+# ============================================================================
+
+# Characters of scripts written without spaces between words: Han (incl. 々
+# and 〇), Hiragana, Katakana (incl. phonetic extensions and half-width forms;
+# not the ・ separator).
+# Hangul is written with spaces, so whitespace splitting already works there.
+_UNSPACED_CHAR_RE = re.compile(
+    "[\u3005\u3007\u3040-\u309f\u30a0-\u30fa\u30fc-\u30ff\u31f0-\u31ff\u3400-\u4dbf"
+    "\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\U00020000-\U0003ffff]"
+)
+
+# Word-equivalents per unspaced character. Measured on the multilingual MLX
+# model (uncapped, seeds 0-2): natural-rate zh speech runs 3.9-5.6 speech
+# tokens per character and ja 2.7-4.9, against ~10-12 per English word. At
+# 0.6, estimate_max_tokens budgets >= 1.39x the zh maximum in every length
+# band, matching the headroom it gives English words. Exact fraction so
+# counts never pick up float error (5 * 0.6 = 3.0000000000000004).
+UNSPACED_CHAR_WORD_WEIGHT = Fraction(3, 5)
+
+
+def count_words(text: str) -> int:
+    """Count words in a way that also works for Chinese and Japanese.
+
+    ``len(text.split())`` sees a whole Chinese or Japanese sentence as one
+    or two "words", which starves every length-based decision (token
+    budgets, chunk merging). Here each Han/kana character counts as
+    ``UNSPACED_CHAR_WORD_WEIGHT`` of a word, and any Latin/digit runs mixed
+    in with them ("ML模型", "2024年") count as one word each; the total is
+    rounded up.
+
+    Text with no such characters returns exactly ``len(text.split())``.
+    """
+    n_unspaced = len(_UNSPACED_CHAR_RE.findall(text))
+    if not n_unspaced:
+        return len(text.split())
+
+    words = 0
+    for token in text.split():
+        if _UNSPACED_CHAR_RE.search(token):
+            # Count the non-CJK pieces that hold letters or digits; bare
+            # punctuation between characters ("视频,转录") is not a word.
+            words += sum(
+                1
+                for part in _UNSPACED_CHAR_RE.split(token)
+                if any(ch.isalnum() for ch in part)
+            )
+        else:
+            words += 1
+    return words + math.ceil(n_unspaced * UNSPACED_CHAR_WORD_WEIGHT)
+
 
 # ============================================================================
 # Spacy Sentence Splitting
@@ -169,6 +224,19 @@ def _get_spacy_model(lang: str = "en"):
                 _spacy_models[lang] = nlp
 
         except Exception as e:
+            if lang in ("ja", "zh"):
+                # e.g. blank("ja") without SudachiPy. The English tokenizer
+                # leaves "。" glued to the text, so its sentencizer never
+                # splits Japanese; blank("zh") segments per character and
+                # splits on 。！？ for both languages.
+                logger.warning(
+                    f"Failed to load spacy model for {lang}: {e}, "
+                    "falling back to a character-level sentencizer"
+                )
+                nlp = spacy.blank("zh")
+                nlp.add_pipe("sentencizer")
+                _spacy_models[lang] = nlp
+                return nlp
             logger.warning(
                 f"Failed to load spacy model for {lang}: {e}, falling back to English"
             )
@@ -201,7 +269,8 @@ def split_into_sentences(text: str, lang: str = "en") -> List[str]:
 
     # Fallback to regex if spacy is not available
     logger.warning("Spacy not available, falling back to regex sentence splitting")
-    sentence_pattern = r"(?<=[.!?])\s+"
+    # Full-width terminators are not followed by a space in CJK text.
+    sentence_pattern = r"(?<=[.!?])\s+|(?<=[。！？])\s*"
     return [s.strip() for s in re.split(sentence_pattern, text) if s.strip()] or [text]
 
 
@@ -240,7 +309,7 @@ def get_adaptive_chunks(
     if not sentences:
         sentences = [text]
 
-    total_words = len(text.split())
+    total_words = count_words(text)
 
     if total_words < threshold_words:
         # Short text: process each sentence individually
@@ -252,7 +321,7 @@ def get_adaptive_chunks(
         current_word_count = 0
 
         for sentence in sentences:
-            sentence_words = len(sentence.split())
+            sentence_words = count_words(sentence)
 
             # If adding this sentence would exceed target, flush current chunk
             if (
@@ -300,7 +369,7 @@ def split_text_intelligently(
     for sentence in sentences:
         if not sentence.strip():
             continue
-        word_count = len(sentence.split())
+        word_count = count_words(sentence)
 
         if current_word_count + word_count > target_words_per_chunk and current_chunk:
             chunks.append(" ".join(current_chunk))
@@ -470,7 +539,7 @@ def estimate_max_tokens(text: str, model_max: int = 4096) -> int:
     Returns:
         Estimated max_new_tokens value
     """
-    word_count = len(text.split())
+    word_count = count_words(text)
 
     # Adaptive estimation based on empirical token usage patterns
     if word_count <= 9:
@@ -532,7 +601,7 @@ def print_generation_plan(
         print(f"{'─'*60}")
         print("  CHUNKS OVERVIEW:")
         for i, chunk in enumerate(chunks):
-            chunk_words = len(chunk.split())
+            chunk_words = count_words(chunk)
             preview = chunk[:60].replace("\n", " ") + ("..." if len(chunk) > 60 else "")
             print(
                 f'    [{i+1}/{num_chunks}] ⏳ pending | {chunk_words:>3} words | "{preview}"'
@@ -551,7 +620,7 @@ def print_chunk_generating(
     chunk_text: str,
 ) -> None:
     """Print status when starting to generate a chunk."""
-    chunk_words = len(chunk_text.split())
+    chunk_words = count_words(chunk_text)
     preview = chunk_text[:40].replace("\n", " ") + (
         "..." if len(chunk_text) > 40 else ""
     )

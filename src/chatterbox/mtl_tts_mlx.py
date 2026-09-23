@@ -61,6 +61,7 @@ from .models.utils import TORCH_LOCK, clear_device_memory, materialize_mlx_state
 
 # Shared generation utilities
 from .generation_utils import (
+    count_words,
     SPACY_AVAILABLE,
     split_into_sentences,
     get_adaptive_chunks,
@@ -132,7 +133,8 @@ SUPPORTED_LANGUAGES = {
 MIN_CHUNK_WORDS = 8
 MAX_CHUNK_WORDS = 30
 
-_TERMINATOR_RE = re.compile(r"[.!?]+[\"”]*$")
+_TERMINATOR_RE = re.compile(r"[.!?。！？]+[\"”]*$")
+_FULLWIDTH_TERMINATORS = frozenset("。！？")
 
 
 def merge_short_sentences(
@@ -143,8 +145,8 @@ def merge_short_sentences(
     """Group adjacent sentences until each group reaches ``min_words``.
 
     Within a group every sentence but the last has its terminal ``.!?``
-    replaced by a comma, so the group reads as one utterance and is
-    synthesized as a single generation. No words are added, removed or
+    replaced by a comma (``。！？`` by a full-width ``，``), so the group
+    reads as one utterance and is synthesized as a single generation. No words are added, removed or
     reordered.
 
     Sentences already at or above ``min_words`` pass through untouched,
@@ -159,7 +161,7 @@ def merge_short_sentences(
     current_words = 0
 
     for sentence in sentences:
-        words = len(sentence.split())
+        words = count_words(sentence)
         if current and (
             current_words >= min_words or current_words + words > max_words
         ):
@@ -172,7 +174,7 @@ def merge_short_sentences(
         # Never leave a short tail as its own chunk -- that is the exact
         # case this function exists to prevent.
         if groups and current_words < min_words:
-            tail_room = sum(len(s.split()) for s in groups[-1]) + current_words
+            tail_room = sum(count_words(s) for s in groups[-1]) + current_words
             if tail_room <= max_words:
                 groups[-1] = groups[-1] + current
                 current = []
@@ -185,8 +187,8 @@ def merge_short_sentences(
             "merged %d sentences into %d chunk(s): %s -> %s words",
             len(sentences),
             len(merged),
-            [len(s.split()) for s in sentences],
-            [len(s.split()) for s in merged],
+            [count_words(s) for s in sentences],
+            [count_words(s) for s in merged],
         )
     return merged
 
@@ -197,9 +199,15 @@ def _join_sentence_group(group: List[str]) -> str:
         return group[0]
     parts = []
     for sentence in group[:-1]:
+        terminator = _TERMINATOR_RE.search(sentence)
+        comma = (
+            "，"
+            if terminator and _FULLWIDTH_TERMINATORS.intersection(terminator.group())
+            else ","
+        )
         stripped = _TERMINATOR_RE.sub("", sentence).rstrip()
         if stripped:
-            parts.append(stripped + ",")
+            parts.append(stripped + comma)
     parts.append(group[-1])
     return " ".join(parts)
 
@@ -655,7 +663,7 @@ class ChatterboxMultilingualTTSMLX:
         # merge cannot strand one mid-text.
         sentences = merge_short_sentences(sentences, MIN_CHUNK_WORDS)
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(sentences)
         lang_name = SUPPORTED_LANGUAGES.get(lang, language_id)
 
@@ -725,7 +733,6 @@ class ChatterboxMultilingualTTSMLX:
         )
 
         for i, sentence in enumerate(sentences):
-            len(sentence.split())
             print_chunk_generating(i, num_chunks, sentence)
             chunk_start = _time.time()
 
@@ -910,7 +917,7 @@ class ChatterboxMultilingualTTSMLX:
                     "no EOS token: generation used all %d tokens for %d-word text "
                     "(%r) -- output may contain hallucinated audio",
                     len(speech_tokens_pt),
-                    len(text.split()),
+                    count_words(text),
                     text[:60],
                 )
 
@@ -1095,7 +1102,7 @@ class ChatterboxMultilingualTTSMLX:
         if not chunks_to_generate:
             chunks_to_generate = [text]
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(chunks_to_generate)
         lang_name = SUPPORTED_LANGUAGES.get(lang, language_id)
 
@@ -1104,7 +1111,7 @@ class ChatterboxMultilingualTTSMLX:
                 stage="text_split",
                 total_chunks=num_chunks,
                 chunk_previews=[
-                    (i + 1, len(chunk.split()), chunk[:50])
+                    (i + 1, count_words(chunk), chunk[:50])
                     for i, chunk in enumerate(chunks_to_generate)
                 ],
             )
@@ -1123,7 +1130,7 @@ class ChatterboxMultilingualTTSMLX:
         total_start = _time.time()
 
         for i, chunk_text in enumerate(chunks_to_generate):
-            chunk_words = len(chunk_text.split())
+            chunk_words = count_words(chunk_text)
 
             if progress_callback:
                 progress_callback(

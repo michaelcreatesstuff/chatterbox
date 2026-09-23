@@ -21,6 +21,7 @@ import numpy as np
 
 # Import shared utilities for consistent behavior across all TTS implementations
 from .generation_utils import (
+    count_words,
     split_text_intelligently,
     crossfade_chunks,
     print_generation_plan,
@@ -631,7 +632,7 @@ class ChatterboxTTSMLX:
         else:
             sentences = [text]
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(sentences)
 
         # Generate audio for each sentence
@@ -823,7 +824,7 @@ class ChatterboxTTSMLX:
             sentences = [text]
 
         # Adaptive chunking: decide strategy based on total word count
-        total_words = len(text.split())
+        total_words = count_words(text)
 
         if total_words < ADAPTIVE_THRESHOLD_WORDS:
             # Short text: process each sentence individually (MLX optimal)
@@ -1450,7 +1451,7 @@ class ChatterboxTTSPureMLX:
         else:
             sentences = [text]
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(sentences)
 
         # Generate audio for each sentence
@@ -1649,7 +1650,7 @@ class ChatterboxTTSPureMLX:
             sentences = [text]
 
         # Adaptive chunking: decide strategy based on total word count
-        total_words = len(text.split())
+        total_words = count_words(text)
 
         if total_words < ADAPTIVE_THRESHOLD_WORDS:
             # Short text: process each sentence individually (MLX optimal)

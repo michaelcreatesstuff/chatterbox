@@ -23,6 +23,7 @@ from .models.utils import clear_device_memory
 
 # Shared generation utilities
 from .generation_utils import (
+    count_words,
     SPACY_AVAILABLE,
     split_into_sentences,
     get_adaptive_chunks,
@@ -405,7 +406,7 @@ class ChatterboxMultilingualTTS:
         else:
             sentences = [text]
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(sentences)
         lang_name = (
             SUPPORTED_LANGUAGES.get(language_id.lower(), language_id)
@@ -462,7 +463,6 @@ class ChatterboxMultilingualTTS:
         total_start = _time.time()
 
         for i, sentence in enumerate(sentences):
-            len(sentence.split())
             print_chunk_generating(i, num_chunks, sentence)
             chunk_start = _time.time()
 
@@ -722,7 +722,7 @@ class ChatterboxMultilingualTTS:
         if not chunks_to_generate:
             chunks_to_generate = [text]
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(chunks_to_generate)
         lang_name = SUPPORTED_LANGUAGES.get(lang, language_id)
 
@@ -731,7 +731,7 @@ class ChatterboxMultilingualTTS:
                 stage="text_split",
                 total_chunks=num_chunks,
                 chunk_previews=[
-                    (i + 1, len(chunk.split()), chunk[:50])
+                    (i + 1, count_words(chunk), chunk[:50])
                     for i, chunk in enumerate(chunks_to_generate)
                 ],
             )
@@ -750,7 +750,7 @@ class ChatterboxMultilingualTTS:
         total_start = _time.time()
 
         for i, chunk_text in enumerate(chunks_to_generate):
-            chunk_words = len(chunk_text.split())
+            chunk_words = count_words(chunk_text)
 
             if progress_callback:
                 progress_callback(
