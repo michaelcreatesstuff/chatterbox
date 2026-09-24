@@ -38,9 +38,6 @@ except (ImportError, AttributeError) as e:
         "See error message above for details."
     ) from e
 
-from .tts import ChatterboxTTS
-from .vc import ChatterboxVC
-from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 from .models import (
     DEBUG_LOGGING,
     is_debug,
@@ -58,3 +55,28 @@ __all__ = [
     "set_mlx_cache_limit",
     "set_mlx_memory_limit",
 ]
+
+# The PyTorch pipelines pull in transformers (via models.t3). Resolve them
+# lazily (PEP 562) so the MLX entry points (tts_mlx, mtl_tts_mlx) import
+# without loading transformers.
+_LAZY_ATTRS = {
+    "ChatterboxTTS": ".tts",
+    "ChatterboxVC": ".vc",
+    "ChatterboxMultilingualTTS": ".mtl_tts",
+    "SUPPORTED_LANGUAGES": ".mtl_tts",
+}
+
+
+def __getattr__(name):
+    module_name = _LAZY_ATTRS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

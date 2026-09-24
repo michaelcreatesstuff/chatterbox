@@ -14,7 +14,7 @@ Supports 23 languages including English, Spanish, French, German, Japanese, Chin
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import TYPE_CHECKING, Optional, List, Dict
 import logging
 import re
 import os
@@ -28,10 +28,10 @@ try:
 except ImportError:
     MLX_AVAILABLE = False
     _mlx_import_error = (
-        "MLX is not installed. Install it with:\n"
-        "  pip install chatterbox-tts[mlx]\n"
+        "MLX is not installed (it requires Apple Silicon). Install it with:\n"
+        "  pip install chatterbox-mlx\n"
         "or manually:\n"
-        "  pip install mlx mlx-lm"
+        "  pip install 'mlx>=0.32.2'"
     )
 
 if not MLX_AVAILABLE:
@@ -47,15 +47,21 @@ from .models.t3_mlx.modules.cond_enc_mlx import T3CondMLX
 from .models.t3.modules.t3_config import T3Config
 from .models.t3.modules.cond_enc import T3Cond
 
-# Use PyTorch S3Gen for now (hybrid approach - T3 in MLX, S3Gen in PyTorch/MPS)
-from .models.s3gen import S3Gen, S3GEN_SR
+# Use PyTorch S3Gen for now (hybrid approach - T3 in MLX, S3Gen in PyTorch/MPS).
+# S3Gen itself is imported where it's constructed: its diffusers dependency
+# imports transformers, which the MLX path shouldn't pay for at import time.
+from .models.s3gen import S3GEN_SR
+
+if TYPE_CHECKING:
+    from .models.s3gen import S3Gen
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.voice_encoder import VoiceEncoder
 from .models.tokenizers import MTLTokenizer
-from .models.utils import clear_device_memory
+from .models.utils import TORCH_LOCK, clear_device_memory, materialize_mlx_state
 
 # Shared generation utilities
 from .generation_utils import (
+    count_words,
     SPACY_AVAILABLE,
     split_into_sentences,
     get_adaptive_chunks,
@@ -127,7 +133,8 @@ SUPPORTED_LANGUAGES = {
 MIN_CHUNK_WORDS = 8
 MAX_CHUNK_WORDS = 30
 
-_TERMINATOR_RE = re.compile(r"[.!?]+[\"”]*$")
+_TERMINATOR_RE = re.compile(r"[.!?。！？]+[\"”]*$")
+_FULLWIDTH_TERMINATORS = frozenset("。！？")
 
 
 def merge_short_sentences(
@@ -138,8 +145,8 @@ def merge_short_sentences(
     """Group adjacent sentences until each group reaches ``min_words``.
 
     Within a group every sentence but the last has its terminal ``.!?``
-    replaced by a comma, so the group reads as one utterance and is
-    synthesized as a single generation. No words are added, removed or
+    replaced by a comma (``。！？`` by a full-width ``，``), so the group
+    reads as one utterance and is synthesized as a single generation. No words are added, removed or
     reordered.
 
     Sentences already at or above ``min_words`` pass through untouched,
@@ -154,7 +161,7 @@ def merge_short_sentences(
     current_words = 0
 
     for sentence in sentences:
-        words = len(sentence.split())
+        words = count_words(sentence)
         if current and (
             current_words >= min_words or current_words + words > max_words
         ):
@@ -167,7 +174,7 @@ def merge_short_sentences(
         # Never leave a short tail as its own chunk -- that is the exact
         # case this function exists to prevent.
         if groups and current_words < min_words:
-            tail_room = sum(len(s.split()) for s in groups[-1]) + current_words
+            tail_room = sum(count_words(s) for s in groups[-1]) + current_words
             if tail_room <= max_words:
                 groups[-1] = groups[-1] + current
                 current = []
@@ -180,8 +187,8 @@ def merge_short_sentences(
             "merged %d sentences into %d chunk(s): %s -> %s words",
             len(sentences),
             len(merged),
-            [len(s.split()) for s in sentences],
-            [len(s.split()) for s in merged],
+            [count_words(s) for s in sentences],
+            [count_words(s) for s in merged],
         )
     return merged
 
@@ -192,9 +199,15 @@ def _join_sentence_group(group: List[str]) -> str:
         return group[0]
     parts = []
     for sentence in group[:-1]:
+        terminator = _TERMINATOR_RE.search(sentence)
+        comma = (
+            "，"
+            if terminator and _FULLWIDTH_TERMINATORS.intersection(terminator.group())
+            else ","
+        )
         stripped = _TERMINATOR_RE.sub("", sentence).rstrip()
         if stripped:
-            parts.append(stripped + ",")
+            parts.append(stripped + comma)
     parts.append(group[-1])
     return " ".join(parts)
 
@@ -323,7 +336,7 @@ class ChatterboxMultilingualTTSMLX:
     def __init__(
         self,
         t3: T3MLX,
-        s3gen: S3Gen,
+        s3gen: "S3Gen",
         ve: VoiceEncoder,
         tokenizer: MTLTokenizer,
         device: str = "mps",
@@ -348,6 +361,10 @@ class ChatterboxMultilingualTTSMLX:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+
+        # Evaluate lazily-built MLX state now, so the model can be used from
+        # threads other than the one that loaded it (MLX streams are per-thread).
+        materialize_mlx_state(self.t3, self.conds)
 
     @classmethod
     def get_supported_languages(cls) -> Dict[str, str]:
@@ -460,6 +477,8 @@ class ChatterboxMultilingualTTSMLX:
 
         # Load S3Gen (PyTorch/MPS) - hybrid approach
         logger.info(f"Loading S3Gen vocoder (PyTorch on {device})...")
+        from .models.s3gen import S3Gen
+
         s3gen = S3Gen()
         s3gen.load_state_dict(
             torch.load(
@@ -506,51 +525,56 @@ class ChatterboxMultilingualTTSMLX:
             wav_fpath: Path to reference audio file
             exaggeration: Emotion exaggeration factor (0.0 to 1.0)
         """
-        # Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
-
-        s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(
-            s3gen_ref_wav, S3GEN_SR, device=self.device
-        )
-
-        # Speech cond prompt tokens
-        t3_cond_prompt_tokens = None
-        if plen := self.t3.hp.speech_cond_prompt_len:
-            s3_tokzr = self.s3gen.tokenizer
-            # Limit audio length more aggressively for memory safety
-            safe_audio_len = min(len(ref_16k_wav), 6 * S3_SR)
-            limited_audio = ref_16k_wav[:safe_audio_len]
-
-            # Memory cleanup before tokenization
-            clear_device_memory()
-
-            # Use smaller max_len to be extra safe
-            safe_max_len = min(plen, 150)
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward(
-                [limited_audio], max_len=safe_max_len
-            )
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(
-                self.device
+        # PyTorch/MPS is not thread-safe; see TORCH_LOCK.
+        with TORCH_LOCK:
+            # Load reference wav
+            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+            ref_16k_wav = librosa.resample(
+                s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR
             )
 
-            # More memory cleanup after tokenization
-            clear_device_memory()
+            s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
+            s3gen_ref_dict = self.s3gen.embed_ref(
+                s3gen_ref_wav, S3GEN_SR, device=self.device
+            )
 
-        # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(
-            self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
-        )
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+            # Speech cond prompt tokens
+            t3_cond_prompt_tokens = None
+            if plen := self.t3.hp.speech_cond_prompt_len:
+                s3_tokzr = self.s3gen.tokenizer
+                # Limit audio length more aggressively for memory safety
+                safe_audio_len = min(len(ref_16k_wav), 6 * S3_SR)
+                limited_audio = ref_16k_wav[:safe_audio_len]
 
-        t3_cond = T3Cond(
-            speaker_emb=ve_embed,
-            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
-        ).to(device=self.device)
+                # Memory cleanup before tokenization
+                clear_device_memory()
 
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+                # Use smaller max_len to be extra safe
+                safe_max_len = min(plen, 150)
+                t3_cond_prompt_tokens, _ = s3_tokzr.forward(
+                    [limited_audio], max_len=safe_max_len
+                )
+                t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(
+                    self.device
+                )
+
+                # More memory cleanup after tokenization
+                clear_device_memory()
+
+            # Voice-encoder speaker embedding
+            ve_embed = torch.from_numpy(
+                self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
+            )
+            ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+
+            t3_cond = T3Cond(
+                speaker_emb=ve_embed,
+                cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+            self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+            materialize_mlx_state(self.conds)
 
     def generate(
         self,
@@ -610,13 +634,14 @@ class ChatterboxMultilingualTTSMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
-            _cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        with TORCH_LOCK:
+            if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
 
         # Normalize text
         text = punc_norm(text)
@@ -638,7 +663,7 @@ class ChatterboxMultilingualTTSMLX:
         # merge cannot strand one mid-text.
         sentences = merge_short_sentences(sentences, MIN_CHUNK_WORDS)
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(sentences)
         lang_name = SUPPORTED_LANGUAGES.get(lang, language_id)
 
@@ -708,7 +733,6 @@ class ChatterboxMultilingualTTSMLX:
         )
 
         for i, sentence in enumerate(sentences):
-            len(sentence.split())
             print_chunk_generating(i, num_chunks, sentence)
             chunk_start = _time.time()
 
@@ -795,67 +819,69 @@ class ChatterboxMultilingualTTSMLX:
             Generated audio waveform as torch tensor
         """
         # Seed all RNGs if seed is provided (for both T3 MLX and S3Gen PyTorch)
-        if seed is not None:
-            # Set all seeds
-            mx.random.seed(seed)
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-            if hasattr(torch, "mps") and torch.backends.mps.is_available():
-                # MPS backend seed setting
-                torch.mps.manual_seed(seed)
+        # Torch work only; T3 below runs on MLX, outside the lock.
+        with TORCH_LOCK:
+            if seed is not None:
+                # Set all seeds
+                mx.random.seed(seed)
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+                if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                    # MPS backend seed setting
+                    torch.mps.manual_seed(seed)
 
-            # Set deterministic behavior for PyTorch operations
-            torch.use_deterministic_algorithms(
-                False
-            )  # Some ops don't support deterministic
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
+                # Set deterministic behavior for PyTorch operations
+                torch.use_deterministic_algorithms(
+                    False
+                )  # Some ops don't support deterministic
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
 
-            # Optional debug logging
-            if os.getenv("CHATTERBOX_DEBUG"):
-                print(f"[SEED] Setting seed={seed}")
+                # Optional debug logging
+                if os.getenv("CHATTERBOX_DEBUG"):
+                    print(f"[SEED] Setting seed={seed}")
 
-        # Normalize and tokenize
-        text = punc_norm(text)
+            # Normalize and tokenize
+            text = punc_norm(text)
 
-        # Estimate max_new_tokens if not provided
-        if max_new_tokens is None:
-            max_new_tokens = estimate_max_tokens(text, self.t3.hp.max_speech_tokens)
+            # Estimate max_new_tokens if not provided
+            if max_new_tokens is None:
+                max_new_tokens = estimate_max_tokens(text, self.t3.hp.max_speech_tokens)
 
-        text_tokens = self.tokenizer.text_to_tokens(
-            text, language_id=language_id.lower() if language_id else None
-        ).to(self.device)
+            text_tokens = self.tokenizer.text_to_tokens(
+                text, language_id=language_id.lower() if language_id else None
+            ).to(self.device)
 
-        # Add start/end tokens for CFG
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+            # Add start/end tokens for CFG
+            if cfg_weight > 0.0:
+                text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
 
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+            sot = self.t3.hp.start_text_token
+            eot = self.t3.hp.stop_text_token
+            text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+            text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
-        # Convert to MLX for T3 inference
-        text_tokens_mx = mx.array(text_tokens.cpu().numpy())
+            # Convert to MLX for T3 inference
+            text_tokens_mx = mx.array(text_tokens.cpu().numpy())
 
-        # Convert T3 conditioning to MLX
-        t3_cond_mx = T3CondMLX(
-            speaker_emb=(
-                mx.array(self.conds.t3.speaker_emb.cpu().numpy())
-                if self.conds.t3.speaker_emb is not None
-                else None
-            ),
-            cond_prompt_speech_tokens=(
-                mx.array(self.conds.t3.cond_prompt_speech_tokens.cpu().numpy())
-                if self.conds.t3.cond_prompt_speech_tokens is not None
-                else None
-            ),
-            emotion_adv=float(self.conds.t3.emotion_adv[0, 0, 0].item()),
-        )
+            # Convert T3 conditioning to MLX
+            t3_cond_mx = T3CondMLX(
+                speaker_emb=(
+                    mx.array(self.conds.t3.speaker_emb.cpu().numpy())
+                    if self.conds.t3.speaker_emb is not None
+                    else None
+                ),
+                cond_prompt_speech_tokens=(
+                    mx.array(self.conds.t3.cond_prompt_speech_tokens.cpu().numpy())
+                    if self.conds.t3.cond_prompt_speech_tokens is not None
+                    else None
+                ),
+                emotion_adv=float(self.conds.t3.emotion_adv[0, 0, 0].item()),
+            )
 
-        # Generate speech tokens with T3 MLX
+            # Generate speech tokens with T3 MLX
         with torch.inference_mode():
             speech_tokens_mx = self.t3.inference(
                 t3_cond=t3_cond_mx,
@@ -877,84 +903,91 @@ class ChatterboxMultilingualTTSMLX:
 
         # Convert back to PyTorch for S3Gen
         speech_tokens_np = np.array(speech_tokens).astype(np.int64)
-        speech_tokens_pt = torch.from_numpy(speech_tokens_np)
+        with TORCH_LOCK:
+            speech_tokens_pt = torch.from_numpy(speech_tokens_np)
 
-        # DEBUG: Log token counts before filtering
-        # Missing EOS means generation ran to the token cap instead of
-        # deciding it was finished -- the signature of a hallucinated
-        # tail. Warn unconditionally: the absence of the existing
-        # "EOS detected" info log is not something a bulk run can grep
-        # for, so this failure was previously silent in production.
-        if not (speech_tokens_pt == 6562).any().item():
-            logger.warning(
-                "no EOS token: generation used all %d tokens for %d-word text "
-                "(%r) -- output may contain hallucinated audio",
-                len(speech_tokens_pt),
-                len(text.split()),
-                text[:60],
-            )
-
-        if os.getenv("CHATTERBOX_DEBUG"):
-            print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
-            print(
-                f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
-            )
-            # Check for SOS/EOS
-            SOS, EOS = 6561, 6562
-            has_sos = (speech_tokens_pt == SOS).any().item()
-            has_eos = (speech_tokens_pt == EOS).any().item()
-            if has_sos:
-                sos_pos = (speech_tokens_pt == SOS).nonzero(as_tuple=True)[0][0].item()
-                print(f"[DEBUG] SOS (6561) found at position {sos_pos}")
-            if has_eos:
-                eos_pos = (speech_tokens_pt == EOS).nonzero(as_tuple=True)[0][0].item()
-                print(f"[DEBUG] EOS (6562) found at position {eos_pos}")
-                print(
-                    f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}"
+            # DEBUG: Log token counts before filtering
+            # Missing EOS means generation ran to the token cap instead of
+            # deciding it was finished -- the signature of a hallucinated
+            # tail. Warn unconditionally: the absence of the existing
+            # "EOS detected" info log is not something a bulk run can grep
+            # for, so this failure was previously silent in production.
+            if not (speech_tokens_pt == 6562).any().item():
+                logger.warning(
+                    "no EOS token: generation used all %d tokens for %d-word text "
+                    "(%r) -- output may contain hallucinated audio",
+                    len(speech_tokens_pt),
+                    count_words(text),
+                    text[:60],
                 )
-            else:
+
+            if os.getenv("CHATTERBOX_DEBUG"):
+                print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
                 print(
-                    "[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens"
+                    f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
                 )
-            # Count special tokens
-            num_special = (speech_tokens_pt >= 6561).sum().item()
-            print(f"[DEBUG] Special tokens (>=6561): {num_special}")
+                # Check for SOS/EOS
+                SOS, EOS = 6561, 6562
+                has_sos = (speech_tokens_pt == SOS).any().item()
+                has_eos = (speech_tokens_pt == EOS).any().item()
+                if has_sos:
+                    sos_pos = (
+                        (speech_tokens_pt == SOS).nonzero(as_tuple=True)[0][0].item()
+                    )
+                    print(f"[DEBUG] SOS (6561) found at position {sos_pos}")
+                if has_eos:
+                    eos_pos = (
+                        (speech_tokens_pt == EOS).nonzero(as_tuple=True)[0][0].item()
+                    )
+                    print(f"[DEBUG] EOS (6562) found at position {eos_pos}")
+                    print(
+                        f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}"
+                    )
+                else:
+                    print(
+                        "[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens"
+                    )
+                # Count special tokens
+                num_special = (speech_tokens_pt >= 6561).sum().item()
+                print(f"[DEBUG] Special tokens (>=6561): {num_special}")
 
-        # Drop invalid tokens (SOS/EOS)
-        speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
+            # Drop invalid tokens (SOS/EOS)
+            speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
 
-        if os.getenv("CHATTERBOX_DEBUG"):
-            print(f"[DEBUG] After drop_invalid_tokens: {len(speech_tokens_pt)} tokens")
+            if os.getenv("CHATTERBOX_DEBUG"):
+                print(
+                    f"[DEBUG] After drop_invalid_tokens: {len(speech_tokens_pt)} tokens"
+                )
 
-        # Filter out tokens >= 6561 (special tokens)
-        speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
+            # Filter out tokens >= 6561 (special tokens)
+            speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
 
-        if os.getenv("CHATTERBOX_DEBUG"):
-            print(
-                f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens"
-            )
-            print(
-                f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
-            )
+            if os.getenv("CHATTERBOX_DEBUG"):
+                print(
+                    f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens"
+                )
+                print(
+                    f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
+                )
 
-        speech_tokens_pt = speech_tokens_pt.to(self.device)
+            speech_tokens_pt = speech_tokens_pt.to(self.device)
 
-        # Re-seed PyTorch RNG right before S3Gen to ensure determinism
-        # This is necessary because T3 generation may have consumed random numbers
-        if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+            # Re-seed PyTorch RNG right before S3Gen to ensure determinism
+            # This is necessary because T3 generation may have consumed random numbers
+            if seed is not None:
+                torch.manual_seed(seed)
+                np.random.seed(seed)
 
-        # Generate waveform with S3Gen (PyTorch/MPS)
-        with torch.inference_mode():
-            wav, sources = self.s3gen.inference(
-                speech_tokens=speech_tokens_pt,
-                ref_dict=self.conds.gen,
-                finalize=False,  # Enable lookahead trimming to prevent extra audio generation
-            )
-            if sources is not None:
-                del sources
-            wav = wav.squeeze(0).detach().cpu().numpy()
+            # Generate waveform with S3Gen (PyTorch/MPS)
+            with torch.inference_mode():
+                wav, sources = self.s3gen.inference(
+                    speech_tokens=speech_tokens_pt,
+                    ref_dict=self.conds.gen,
+                    finalize=False,  # Enable lookahead trimming to prevent extra audio generation
+                )
+                if sources is not None:
+                    del sources
+                wav = wav.squeeze(0).detach().cpu().numpy()
 
         if os.getenv("CHATTERBOX_DEBUG"):
             wav_duration = len(wav) / self.sr
@@ -1053,13 +1086,14 @@ class ChatterboxMultilingualTTSMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
-            _cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        with TORCH_LOCK:
+            if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
 
         # Get adaptive chunks based on text length
         lang = language_id.lower() if language_id else "en"
@@ -1068,7 +1102,7 @@ class ChatterboxMultilingualTTSMLX:
         if not chunks_to_generate:
             chunks_to_generate = [text]
 
-        total_words = len(text.split())
+        total_words = count_words(text)
         num_chunks = len(chunks_to_generate)
         lang_name = SUPPORTED_LANGUAGES.get(lang, language_id)
 
@@ -1077,7 +1111,7 @@ class ChatterboxMultilingualTTSMLX:
                 stage="text_split",
                 total_chunks=num_chunks,
                 chunk_previews=[
-                    (i + 1, len(chunk.split()), chunk[:50])
+                    (i + 1, count_words(chunk), chunk[:50])
                     for i, chunk in enumerate(chunks_to_generate)
                 ],
             )
@@ -1096,7 +1130,7 @@ class ChatterboxMultilingualTTSMLX:
         total_start = _time.time()
 
         for i, chunk_text in enumerate(chunks_to_generate):
-            chunk_words = len(chunk_text.split())
+            chunk_words = count_words(chunk_text)
 
             if progress_callback:
                 progress_callback(

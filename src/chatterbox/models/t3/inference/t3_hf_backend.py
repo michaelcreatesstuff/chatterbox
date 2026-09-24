@@ -37,6 +37,10 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         self._added_cond = False
         self.alignment_stream_analyzer = alignment_stream_analyzer
 
+    def _init_weights(self, module):
+        # Every submodule here wraps T3's already-loaded weights; never let HF init overwrite them.
+        pass
+
     @torch.inference_mode()
     def prepare_inputs_for_generation(
         self,

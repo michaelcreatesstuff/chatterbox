@@ -1,6 +1,7 @@
 from os import environ
 import gc
 import logging
+import threading
 import torch
 from torch import bfloat16, float16, float32, cuda, backends, mps
 from psutil import virtual_memory
@@ -134,14 +135,23 @@ def contiguous_view(tensor: torch.Tensor, *shape: int) -> torch.Tensor:
     return ensure_contiguous(tensor).view(*shape)
 
 
+# PyTorch's MPS backend is not thread-safe: two threads driving it at once abort
+# inside Metal ("Scheduled handler provided after commit call"). MLX is (streams
+# are per-thread), so the MLX pipelines hold this lock only around their PyTorch
+# work (S3Gen, voice encoder, conditioning, tensor moves) and never around T3,
+# letting MLX generation on different threads overlap.
+TORCH_LOCK = threading.RLock()
+
+
 def clear_device_memory():
     """Clear GPU memory for both CUDA and MPS devices."""
     gc.collect()
-    if cuda.is_available():
-        cuda.empty_cache()
-    elif hasattr(backends, "mps") and backends.mps.is_available():
-        mps.empty_cache()
-        mps.synchronize()
+    with TORCH_LOCK:
+        if cuda.is_available():
+            cuda.empty_cache()
+        elif hasattr(backends, "mps") and backends.mps.is_available():
+            mps.empty_cache()
+            mps.synchronize()
 
 
 # =============================================================================
@@ -157,6 +167,43 @@ def _get_mlx():
         return mx
     except ImportError:
         return None
+
+
+def materialize_mlx_state(*objs):
+    """Evaluate every MLX array reachable from ``objs`` on the calling thread.
+
+    Since MLX 0.31.2 each thread has its own default stream, and a lazy array
+    whose graph was built on one thread raises "There is no Stream(gpu, 0) in
+    current thread" when evaluated on another. Loading a model leaves such
+    graphs behind (random init of unloaded params, casts, rope tables), so call
+    this before a model or its cached conditioning can be used from another
+    thread. Walks MLX modules (including underscore attributes), dicts,
+    lists/tuples and chatterbox objects; PyTorch modules and tensors are skipped.
+    """
+    mx = _get_mlx()
+    if mx is None:
+        return
+    arrays, seen = [], set()
+    stack = list(objs)
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, mx.array):
+            arrays.append(obj)
+            continue
+        if isinstance(obj, (torch.Tensor, torch.nn.Module)):
+            continue
+        if isinstance(obj, dict):  # includes mlx.nn.Module, which is a dict
+            stack.extend(obj.values())
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        module = type(obj).__module__ or ""
+        if hasattr(obj, "__dict__") and module.startswith(("chatterbox.", "mlx.")):
+            stack.extend(vars(obj).values())
+    if arrays:
+        mx.eval(arrays)
 
 
 def set_mlx_cache_limit(limit_gb: float = 4.0):
@@ -316,7 +363,8 @@ def get_memory_info():
     # MPS memory
     if hasattr(backends, "mps") and backends.mps.is_available():
         try:
-            mps.synchronize()
+            with TORCH_LOCK:
+                mps.synchronize()
             info["mps_allocated_mb"] = mps.current_allocated_memory() / 1024**2
             if hasattr(mps, "driver_allocated_memory"):
                 info["mps_driver_mb"] = mps.driver_allocated_memory() / 1024**2
