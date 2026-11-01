@@ -113,7 +113,49 @@ wav = model.generate_long(
 ta.save("long_output.wav", wav, model.sr)
 ```
 
-### Chatterbox-Flash (fastest, English)
+### Chatterbox-Nano and Chatterbox-Turbo (fastest, English)
+
+[Chatterbox-Turbo](https://huggingface.co/ResembleAI/chatterbox-turbo) (350M) and [Chatterbox-Nano](https://huggingface.co/ResembleAI/chatterbox-nano) (110M) use a GPT-2 T3 decoder and the meanflow S3Gen vocoder. Both models use one class. This port runs the T3 decode loop, the sampling and the vocoder in MLX.
+
+```python
+import soundfile as sf
+from chatterbox.tts_turbo_mlx import ChatterboxTurboMLX
+
+model = ChatterboxTurboMLX.from_pretrained(nano=True)  # nano=False loads Turbo
+# Optional: clone a voice (longer than 5 s). Without it, the built-in voice is used.
+model.prepare_conditionals("reference_voice.wav")
+
+wav = model.generate("Hello! [chuckle] This is Chatterbox-Nano on Apple Silicon.", seed=0)
+sf.write("nano.wav", wav, model.sr)
+print(model.last_timings)  # t3_s, s3gen_s, watermark_s, n_speech_tokens, n_chunks, ...
+```
+
+`generate()` splits long text at sentence boundaries. It decodes up to 8 chunks together as one batch, then crossfades them. Each chunk has a token limit from its word count, so one chunk cannot run on. The output has a Perth watermark, the same as upstream. Set `watermark=False` to skip it.
+
+Measured on an Apple M4 (32 GB), fp16. RTF is generation time divided by audio time, so lower is faster. WER comes from Whisper large-v3-turbo. WER ranges cover three LibriSpeech voices (two female, one male), the built-in voice (Nano and Turbo only), and two seeds.
+
+| System | Medium text (13-15 s audio) | 292-word text (~1:35-2:00 audio) |
+| --- | --- | --- |
+| **Chatterbox-Nano, this port** | **RTF 0.12 (8.3x real time), WER 0.00** | **RTF 0.083 (12x), WER 0.005-0.007** |
+| Chatterbox-Turbo, this port | RTF 0.25 (4.0x), WER 0.00-0.03 | RTF 0.12 (8.2x), WER 0.002-0.012 |
+| Chatterbox-Flash, this port | RTF 0.37 (2.7x), WER 0.00-0.23 | RTF 0.31 (3.2x), WER 0.00-0.003 |
+| Chatterbox-Nano, upstream PyTorch (MPS) | RTF 0.32 (3.2x), WER 0.00-0.03 | collapses (no sentence splitting) |
+| Chatterbox-Turbo, mlx-audio fp16 | RTF 0.51 (2.0x) | RTF 0.53 (1.9x) |
+
+For the 292-word text, the WER is the mean over the sentence chunks. Whisper adds repeated words to clips longer than about 30 s, so a WER of the full clip is not reliable.
+
+Useful options:
+
+- `quantize_bits` (load time): `8` makes Turbo about 30% faster on medium text. `4` makes Nano about 25% faster on medium text. Do not use `4` with Turbo: long text runs on and its WER goes up. The quantization WER checks used a synthetic reference only. Listen to the output before you use quantization.
+- `max_batch_chunks` (default 8): set 1 to decode chunks one by one. Long text is then 1.5-2x slower.
+- `release_caches()`: frees the KV caches. The next call rebuilds them.
+
+Known limits:
+
+- Use a reference clip of clear speech, 10-15 s long. A non-speech clip (a tone or music) makes the model babble at the start of each sentence chunk.
+- `cfg_weight`, `exaggeration` and `min_p` have no effect, the same as upstream Turbo.
+
+### Chatterbox-Flash (English)
 
 [Chatterbox-Flash](https://huggingface.co/ResembleAI/chatterbox-flash) replaces the autoregressive T3 decoder with a block-diffusion decoder. It unmasks a block of speech tokens in parallel per step. This port runs the full T3 loop and the meanflow S3Gen vocoder in MLX.
 
@@ -131,12 +173,12 @@ print(model.last_timings)  # t3_s, s3gen_s, n_speech_tokens, n_chunks, ...
 
 `generate()` splits text over 35 words at sentence boundaries. It decodes up to 4 chunks together as one batch, then crossfades them. You do not need a separate long-form method.
 
-Measured on an Apple M4 (32 GB), fp16, with the same reference voice for all systems. RTF is generation time divided by audio time, so lower is faster. WER comes from Whisper large-v3-turbo.
+Measured on an Apple M4 (32 GB), fp16. RTF is generation time divided by audio time, so lower is faster. The WER is the range over three LibriSpeech voices and two seeds, from Whisper large-v3-turbo.
 
 | System | Medium text (15 s audio) | 292-word text (~1:50 audio) |
 | --- | --- | --- |
-| **Chatterbox-Flash, this port** | **RTF 0.37 (2.7x real time)** | **RTF 0.31 (3.2x), WER 0.08** |
-| Chatterbox-Turbo, mlx-audio fp16 | RTF 0.51 (2.0x) | RTF 0.52 (1.9x), WER 0.23-0.76 (loops) |
+| **Chatterbox-Flash, this port** | **RTF 0.37 (2.7x real time)** | **RTF 0.31 (3.2x), WER 0.00-0.003** |
+| Chatterbox-Turbo, mlx-audio fp16 | RTF 0.51 (2.0x) | RTF 0.53 (1.9x) |
 | Chatterbox-Flash, upstream MLX backend | RTF 0.99 (1.0x) | not run (RTF 1.25 on a 75-word text) |
 
 Useful options:
@@ -149,7 +191,7 @@ Useful options:
 Known limits:
 
 - Keep `cfg_scale=1.0`. Without guidance, long text loops and the pitch drifts.
-- Very short inputs (one short sentence) sometimes drop or garble the first words. The upstream PyTorch model does the same.
+- With some voices, Flash adds a few babbled words after the end of a short text (WER 0.23 on medium text with one of three test voices).
 - 4-bit quantization breaks long text. Do not use it with Flash.
 - Flash output has no watermark, the same as upstream Flash.
 
