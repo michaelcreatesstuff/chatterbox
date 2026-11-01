@@ -16,6 +16,7 @@ from typing import List
 import math
 import re
 import logging
+import os
 import subprocess
 import sys
 import numpy as np
@@ -112,12 +113,18 @@ def _download_spacy_model(model_name: str) -> bool:
     logger.info(f"Downloading spacy model: {model_name} (this may take a minute)...")
 
     try:
-        # Use python -m spacy download which handles pip installation
+        # Use python -m spacy download which handles pip installation.
+        # Without pip, spaCy falls back to `uv pip install`, which needs
+        # VIRTUAL_ENV to find this interpreter's venv when it is not activated.
+        env = os.environ.copy()
+        if sys.prefix != sys.base_prefix:
+            env.setdefault("VIRTUAL_ENV", sys.prefix)
         result = subprocess.run(
             [sys.executable, "-m", "spacy", "download", model_name],
             capture_output=True,
             text=True,
             timeout=300,  # 5 minute timeout for download
+            env=env,
         )
 
         if result.returncode == 0:

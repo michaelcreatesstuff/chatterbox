@@ -37,6 +37,7 @@ dependencies = [
     "spacy-pkuseg==1.0.1",
     "pykakasi==2.3.0",
     "psutil==7.2.0",
+    "pyloudnorm>=0.1.1",  # Turbo/Nano reference loudness normalisation
     "mlx>=0.32.2",
 ]
 
