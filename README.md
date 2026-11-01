@@ -75,8 +75,9 @@ Generate speech directly from the terminal:
 import torchaudio as ta
 from chatterbox.tts_mlx import ChatterboxTTSMLX
 
-# Load model (downloads weights automatically on first run). Default is "cpu", choose "hybrid-mlx" for best performance on an Apple Silicon device.
-model = ChatterboxTTSMLX.from_pretrained(device="hybrid-mlx")
+# Load model (downloads weights automatically on first run). T3 runs on MLX;
+# device sets where S3Gen runs: "mps" (default, Apple GPU) or "cpu".
+model = ChatterboxTTSMLX.from_pretrained(device="mps")
 
 
 # Generate speech
