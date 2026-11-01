@@ -228,6 +228,9 @@ class CausalMaskedDiffWithXvecMLX(nn.Module):
         prompt_feat_len: Optional[int],
         embedding: mx.array,
         finalize: bool = False,
+        n_timesteps: Optional[int] = None,
+        noised_mels: Optional[mx.array] = None,
+        meanflow: bool = False,
     ) -> Tuple[mx.array, None]:
         """
         Inference forward pass for causal model.
@@ -241,11 +244,16 @@ class CausalMaskedDiffWithXvecMLX(nn.Module):
             prompt_feat_len: Prompt mel length (unused)
             embedding: Speaker embedding [B, spk_dim]
             finalize: Whether this is the final chunk
+            n_timesteps: CFM steps; None -> 5 midpoint steps (CFG)
+            noised_mels: Optional noise for the generated frames [B, 80, T_gen]
+            meanflow: Meanflow Euler solve (no CFG)
 
         Returns:
             Generated mel spectrogram [B, C, T]
             None (no cache in causal mode)
         """
+        if n_timesteps is None:
+            n_timesteps = 5
         assert token.shape[0] == 1, "Only batch size 1 supported"
 
         # Normalize and project speaker embedding
@@ -293,7 +301,9 @@ class CausalMaskedDiffWithXvecMLX(nn.Module):
             mask=mx.expand_dims(mel_mask, axis=1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5,
+            n_timesteps=n_timesteps,
+            noised_mels=noised_mels,
+            meanflow=meanflow,
         )
 
         # Extract generated portion (after prompt)

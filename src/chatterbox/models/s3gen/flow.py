@@ -279,7 +279,13 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         prompt_feat_len,
         embedding,
         finalize,
+        n_timesteps=None,
+        noised_mels=None,
+        meanflow=False,
     ):
+        # n_timesteps=None keeps the default: 5 midpoint steps (10 NFEs) with CFG.
+        if n_timesteps is None:
+            n_timesteps = 5
         if self.fp16 is True:
             prompt_feat = prompt_feat.half()
             embedding = embedding.half()
@@ -322,7 +328,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5,  # Midpoint: 5 steps × 2 evals = 10 total (vs Euler 10 steps × 1 eval = 10)
+            n_timesteps=n_timesteps,
+            noised_mels=noised_mels,
+            meanflow=meanflow,
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2

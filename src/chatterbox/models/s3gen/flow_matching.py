@@ -339,7 +339,17 @@ class CausalConditionalCFM(ConditionalCFM):
         return self._rand_noise[:, :, :size].to(device=device, dtype=dtype)
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+    def forward(
+        self,
+        mu,
+        mask,
+        n_timesteps,
+        temperature=1.0,
+        spks=None,
+        cond=None,
+        noised_mels=None,
+        meanflow=False,
+    ):
         """Forward diffusion
 
         Args:
@@ -352,6 +362,9 @@ class CausalConditionalCFM(ConditionalCFM):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond: Not used but kept for future purposes
+            noised_mels: noise for the generated (non-prompt) frames; overrides z there.
+                shape: (batch_size, n_feats, mel_timesteps - prompt_len)
+            meanflow: meanflow mode (linear t_span, no CFG, Euler with end time r)
 
         Returns:
             sample: generated mel-spectrogram
@@ -359,13 +372,41 @@ class CausalConditionalCFM(ConditionalCFM):
         """
 
         z = self._get_rand_noise(mu.size(2), mu.device, mu.dtype) * temperature
+        if noised_mels is not None:
+            prompt_len = mu.size(2) - noised_mels.size(2)
+            z[..., prompt_len:] = noised_mels.to(device=z.device, dtype=z.dtype)
         # fix prompt and overlap part mu and z
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        if self.t_scheduler == "cosine":
+        if (not meanflow) and self.t_scheduler == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+
+        # NOTE (upstream): the only meanflow models are also distilled models, which
+        # don't need CFG because they were distilled with CFG outputs.
+        if meanflow:
+            return (
+                self.basic_euler(
+                    z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond
+                ),
+                None,
+            )
         return (
             self.solve_midpoint(
                 z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond
             ),
             None,
         )
+
+    def basic_euler(self, x, t_span, mu, mask, spks, cond):
+        """Meanflow Euler solve without CFG (ported from upstream).
+
+        Each step predicts the average velocity over [t, r] and jumps x by (r - t).
+        """
+        for t, r in zip(t_span[..., :-1], t_span[..., 1:]):
+            t, r = t[None], r[None]
+            dxdt = self.estimator.forward(
+                x, mask=mask, mu=mu, t=t, spks=spks, cond=cond, r=r
+            )
+            dt = r - t
+            x = x + dt * dxdt
+
+        return x.float()
