@@ -98,8 +98,11 @@ class S3Token2MelMLX(nn.Module):
         input_frame_rate: int = 25,
         spk_embed_dim: int = 192,
         output_size: int = 80,
+        # Meanflow-distilled CFM (Chatterbox-Flash / Turbo s3gen.safetensors)
+        meanflow: bool = False,
     ):
         super().__init__()
+        self.meanflow = meanflow
 
         logger.info("[MLX] Initializing S3Token2MelMLX")
 
@@ -136,6 +139,7 @@ class S3Token2MelMLX(nn.Module):
             num_mid_blocks=decoder_num_mid_blocks,
             num_heads=decoder_num_heads,
             act_fn="gelu",
+            meanflow=meanflow,
         )
 
         # CFM decoder (created locally, stored only in flow)
@@ -207,6 +211,8 @@ class S3Token2MelMLX(nn.Module):
         speech_tokens: mx.array,
         ref_dict: Dict[str, mx.array],
         finalize: bool = False,
+        n_cfm_timesteps: Optional[int] = None,
+        noised_mels: Optional[mx.array] = None,
     ) -> mx.array:
         """
         Generate mel spectrogram from speech tokens.
@@ -215,6 +221,8 @@ class S3Token2MelMLX(nn.Module):
             speech_tokens: S3 speech tokens [B, T] or [T]
             ref_dict: Reference embedding dictionary
             finalize: Whether this is the final chunk
+            n_cfm_timesteps: CFM steps; None -> 2 if meanflow else 5 (midpoint)
+            noised_mels: Optional noise for the generated frames [B, 80, T_gen]
 
         Returns:
             Generated mel spectrogram [B, C, T]
@@ -236,6 +244,9 @@ class S3Token2MelMLX(nn.Module):
             prompt_feat_len=ref_dict.get("prompt_feat_len"),
             embedding=ref_dict["embedding"],
             finalize=finalize,
+            n_timesteps=n_cfm_timesteps or (2 if self.meanflow else None),
+            noised_mels=noised_mels,
+            meanflow=self.meanflow,
         )
 
         return output_mels
@@ -281,6 +292,7 @@ class S3Token2WavMLX(S3Token2MelMLX):
         speech_tokens: mx.array,
         ref_dict: Dict[str, mx.array],
         finalize: bool = False,
+        n_cfm_timesteps: Optional[int] = None,
     ) -> mx.array:
         """
         Generate waveform from speech tokens.
@@ -294,7 +306,9 @@ class S3Token2WavMLX(S3Token2MelMLX):
             Generated waveform [B, T_audio]
         """
         # Get mel spectrogram
-        output_mels = super().__call__(speech_tokens, ref_dict, finalize)
+        output_mels = super().__call__(
+            speech_tokens, ref_dict, finalize, n_cfm_timesteps=n_cfm_timesteps
+        )
 
         # Convert to waveform
         output_wavs, _ = self.mel2wav.inference(
@@ -313,6 +327,7 @@ class S3Token2WavMLX(S3Token2MelMLX):
         speech_tokens: mx.array,
         ref_dict: Dict[str, mx.array],
         finalize: bool = False,
+        n_cfm_timesteps: Optional[int] = None,
     ) -> mx.array:
         """
         Run only the flow (token-to-mel) inference.
@@ -325,7 +340,9 @@ class S3Token2WavMLX(S3Token2MelMLX):
         Returns:
             Generated mel spectrogram
         """
-        result = S3Token2MelMLX.__call__(self, speech_tokens, ref_dict, finalize)
+        result = S3Token2MelMLX.__call__(
+            self, speech_tokens, ref_dict, finalize, n_cfm_timesteps=n_cfm_timesteps
+        )
         # Force evaluation to prevent lazy computation graph buildup
         mx.eval(result)
         return result
@@ -360,6 +377,7 @@ class S3Token2WavMLX(S3Token2MelMLX):
         speech_tokens: mx.array,
         ref_dict: Dict[str, mx.array],
         finalize: bool = True,
+        n_cfm_timesteps: Optional[int] = None,
     ) -> Tuple[mx.array, mx.array]:
         """
         Full inference pipeline.
@@ -368,6 +386,7 @@ class S3Token2WavMLX(S3Token2MelMLX):
             speech_tokens: S3 speech tokens
             ref_dict: Reference embedding dictionary
             finalize: Whether this is the final chunk
+            n_cfm_timesteps: CFM steps; None -> 2 if meanflow else 5 (midpoint)
 
         Returns:
             Generated waveform, source signal
@@ -377,7 +396,9 @@ class S3Token2WavMLX(S3Token2MelMLX):
 
         # Flow inference (token -> mel)
         _log_s3gen_memory("before_flow_inference")
-        output_mels = self.flow_inference(speech_tokens, ref_dict, finalize)
+        output_mels = self.flow_inference(
+            speech_tokens, ref_dict, finalize, n_cfm_timesteps=n_cfm_timesteps
+        )
         _log_s3gen_memory("after_flow_inference")
 
         # HiFiGAN inference (mel -> waveform)

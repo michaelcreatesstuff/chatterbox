@@ -135,26 +135,25 @@ class ConditionalCFMMLX(nn.Module):
         t = t_span[0]
         dt = t_span[1] - t_span[0]
 
-        # Pre-allocate CFG buffers (batch size 2 for conditional/unconditional)
-        mel_len = x.shape[2]
-        x_in = mx.zeros((2, 80, mel_len))
-        mask_in = mx.zeros((2, 1, mel_len))
-        mu_in = mx.zeros((2, 80, mel_len))
-        t_in = mx.zeros((2,))
-        spks_in = mx.zeros((2, 80)) if spks is not None else None
-        cond_in = mx.zeros((2, 80, mel_len)) if cond is not None else None
+        # CFG batch (conditional, unconditional). The conditioning inputs do not
+        # change across steps, so build them once instead of per step.
+        mask_in = mx.broadcast_to(mask, (2,) + mask.shape[1:])
+        mu_in = mx.concatenate([mu, mx.zeros_like(mu)], axis=0)
+        spks_in = (
+            mx.concatenate([spks, mx.zeros_like(spks)], axis=0)
+            if spks is not None
+            else None
+        )
+        cond_in = (
+            mx.concatenate([cond, mx.zeros_like(cond)], axis=0)
+            if cond is not None
+            else None
+        )
 
         for step in range(1, len(t_span)):
             # Half step: evaluate derivative at current position
             x_in = mx.broadcast_to(x, (2,) + x.shape[1:])
-            mask_in = mx.broadcast_to(mask, (2,) + mask.shape[1:])
-            mu_in = mx.concatenate([mu, mx.zeros_like(mu)], axis=0)
             t_in = mx.broadcast_to(mx.expand_dims(t, axis=0), (2,))
-
-            if spks is not None:
-                spks_in = mx.concatenate([spks, mx.zeros_like(spks)], axis=0)
-            if cond is not None:
-                cond_in = mx.concatenate([cond, mx.zeros_like(cond)], axis=0)
 
             k1 = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
 
@@ -194,6 +193,29 @@ class ConditionalCFMMLX(nn.Module):
 
         return x
 
+    def basic_euler(
+        self,
+        x: mx.array,
+        t_span: mx.array,
+        mu: mx.array,
+        mask: mx.array,
+        spks: Optional[mx.array],
+        cond: Optional[mx.array],
+    ) -> mx.array:
+        """Meanflow Euler solve without CFG (port of upstream torch basic_euler).
+
+        Each step predicts the average velocity over [t, r] and jumps x by r - t.
+        Batch stays at B (no CFG doubling).
+        """
+        for i in range(t_span.shape[0] - 1):
+            t = t_span[i : i + 1]
+            r = t_span[i + 1 : i + 2]
+            dxdt = self.estimator(x, mask, mu, t, spks, cond, r=r)
+            x = x + (r - t) * dxdt
+
+        mx.eval(x)
+        return x
+
 
 class CausalConditionalCFMMLX(ConditionalCFMMLX):
     """Causal version of Conditional CFM for streaming."""
@@ -218,14 +240,31 @@ class CausalConditionalCFMMLX(ConditionalCFMMLX):
         temperature: float = 1.0,
         spks: Optional[mx.array] = None,
         cond: Optional[mx.array] = None,
+        noised_mels: Optional[mx.array] = None,
+        meanflow: bool = False,
     ) -> Tuple[mx.array, None]:
-        """Forward diffusion for causal mode."""
+        """Forward diffusion for causal mode.
+
+        Args:
+            noised_mels: Optional noise for the generated (non-prompt) frames,
+                (B, 80, T - prompt_len); overrides z there (as upstream torch).
+            meanflow: Linear t_span, no CFG, Euler solve with end time r.
+        """
         # Generate fresh random noise each time (do NOT cache - causes hiss)
         z = mx.random.normal(mu.shape) * temperature
+        if noised_mels is not None:
+            prompt_len = mu.shape[2] - noised_mels.shape[2]
+            z = mx.concatenate(
+                [z[:, :, :prompt_len], noised_mels.astype(z.dtype)], axis=2
+            )
 
         t_span = mx.linspace(0, 1, n_timesteps + 1)
-        if self.t_scheduler == "cosine":
+        if (not meanflow) and self.t_scheduler == "cosine":
             t_span = 1 - mx.cos(t_span * 0.5 * mx.array(3.14159265))
+
+        if meanflow:
+            # Meanflow models are CFG-distilled: no CFG at inference (upstream).
+            return self.basic_euler(z, t_span, mu, mask, spks, cond), None
 
         result = self.solve_midpoint(z, t_span, mu, mask, spks, cond)
         return result, None

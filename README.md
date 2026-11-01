@@ -113,6 +113,46 @@ wav = model.generate_long(
 ta.save("long_output.wav", wav, model.sr)
 ```
 
+### Chatterbox-Flash (fastest, English)
+
+[Chatterbox-Flash](https://huggingface.co/ResembleAI/chatterbox-flash) replaces the autoregressive T3 decoder with a block-diffusion decoder. It unmasks a block of speech tokens in parallel per step. This port runs the full T3 loop and the meanflow S3Gen vocoder in MLX.
+
+```python
+import soundfile as sf
+from chatterbox.tts_flash_mlx import ChatterboxFlashMLX
+
+model = ChatterboxFlashMLX.from_pretrained()  # MLX vocoder by default
+model.prepare_conditionals("reference_voice.wav")  # required: Flash has no built-in voice
+
+wav = model.generate("Hello! This is Chatterbox-Flash running on Apple Silicon.", seed=0)
+sf.write("flash.wav", wav, model.sr)
+print(model.last_timings)  # t3_s, s3gen_s, n_speech_tokens, n_chunks, ...
+```
+
+`generate()` splits text over 35 words at sentence boundaries. It decodes up to 4 chunks together as one batch, then crossfades them. You do not need a separate long-form method.
+
+Measured on an Apple M4 (32 GB), fp16, with the same reference voice for all systems. RTF is generation time divided by audio time, so lower is faster. WER comes from Whisper large-v3-turbo.
+
+| System | Medium text (15 s audio) | 292-word text (~1:50 audio) |
+| --- | --- | --- |
+| **Chatterbox-Flash, this port** | **RTF 0.37 (2.7x real time)** | **RTF 0.31 (3.2x), WER 0.08** |
+| Chatterbox-Turbo, mlx-audio fp16 | RTF 0.51 (2.0x) | RTF 0.52 (1.9x), WER 0.23-0.76 (loops) |
+| Chatterbox-Flash, upstream MLX backend | RTF 0.99 (1.0x) | not run (RTF 1.25 on a 75-word text) |
+
+Useful options:
+
+- `block_size` (load time, default 24): diffusion block length. Set 16 for the paper configuration. Set 32 for about 20% more speed at a small WER cost.
+- `preset` (`"paper"`, `"balanced"`, `"fast"`): early-decoding strength. `"paper"` is the default. Stronger presets use fewer steps per block, at some quality cost on short text.
+- `max_batch_chunks` (default 4): set 1 to decode chunks one by one.
+- `release_caches()`: frees the KV caches after a long document. The next call rebuilds them.
+
+Known limits:
+
+- Keep `cfg_scale=1.0`. Without guidance, long text loops and the pitch drifts.
+- Very short inputs (one short sentence) sometimes drop or garble the first words. The upstream PyTorch model does the same.
+- 4-bit quantization breaks long text. Do not use it with Flash.
+- Flash output has no watermark, the same as upstream Flash.
+
 ## 🙏 Acknowledgements
 
 This project is built on top of the excellent **[Chatterbox TTS](https://github.com/resemble-ai/chatterbox)** by [Resemble AI](https://resemble.ai). I'm deeply grateful for their work in creating and open-sourcing a production-grade, multilingual text-to-speech system under the MIT license.

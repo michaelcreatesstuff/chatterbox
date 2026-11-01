@@ -158,6 +158,7 @@ class ConditionalDecoderMLX(nn.Module):
         num_mid_blocks: int = 12,
         num_heads: int = 8,
         act_fn: str = "gelu",
+        meanflow: bool = False,
     ):
         """Initialize ConditionalDecoderMLX.
 
@@ -172,10 +173,13 @@ class ConditionalDecoderMLX(nn.Module):
             num_mid_blocks: Number of mid blocks.
             num_heads: Number of attention heads.
             act_fn: Activation function for transformer.
+            meanflow: Add the meanflow time-embedding mixer and accept the end
+                time ``r`` in ``__call__`` (weight key ``time_embed_mixer.weight``).
         """
         super().__init__()
 
         channels = tuple(channels)
+        self.meanflow = meanflow
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.causal = causal
@@ -310,6 +314,21 @@ class ConditionalDecoderMLX(nn.Module):
 
         self.final_proj = nn.Conv1d(reversed_channels[-1], out_channels, kernel_size=1)
 
+        # Meanflow time mixer: Linear(2D -> D, no bias), diagonal init (identity on
+        # the t half) as in upstream utils/intmeanflow.py. Created last so the
+        # non-meanflow parameter init stream is unchanged.
+        if meanflow:
+            self.time_embed_mixer = nn.Linear(
+                time_embed_dim * 2, time_embed_dim, bias=False
+            )
+            self.time_embed_mixer.weight = mx.concatenate(
+                [
+                    mx.eye(time_embed_dim),
+                    mx.zeros((time_embed_dim, time_embed_dim)),
+                ],
+                axis=1,
+            )
+
     def __call__(
         self,
         x: mx.array,
@@ -318,6 +337,7 @@ class ConditionalDecoderMLX(nn.Module):
         t: mx.array,
         spks: Optional[mx.array] = None,
         cond: Optional[mx.array] = None,
+        r: Optional[mx.array] = None,
     ) -> mx.array:
         """Forward pass of U-Net conditional decoder.
 
@@ -328,6 +348,7 @@ class ConditionalDecoderMLX(nn.Module):
             t: Time step (batch,).
             spks: Speaker embedding (batch, spk_dim).
             cond: Additional conditioning (batch, cond_dim, time).
+            r: End time for meanflow mode (batch,). Ignored unless meanflow.
 
         Returns:
             Predicted velocity field (batch, mel_channels, time).
@@ -335,6 +356,11 @@ class ConditionalDecoderMLX(nn.Module):
         # Time embedding
         t_emb = self.time_embeddings(t).astype(t.dtype)
         t_emb = self.time_mlp(t_emb)
+
+        if self.meanflow:
+            r_emb = self.time_embeddings(r).astype(t_emb.dtype)
+            r_emb = self.time_mlp(r_emb)
+            t_emb = self.time_embed_mixer(mx.concatenate([t_emb, r_emb], axis=1))
 
         # Pack inputs: [x, mu]
         x = mx.concatenate([x, mu], axis=1)

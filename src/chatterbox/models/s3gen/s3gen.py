@@ -105,11 +105,14 @@ class S3Token2Mel(torch.nn.Module):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
+    def __init__(self, meanflow=False):
         log_message("[INIT] Starting S3Token2Mel initialization")
         log_memory("start_s3token2mel_init")
 
         super().__init__()
+        # meanflow=True: meanflow-distilled CFM (e.g. Chatterbox-Flash / Turbo s3gen),
+        # sampled with a CFG-free Euler solve in 2 steps by default.
+        self.meanflow = meanflow
 
         log_message("[INIT] Creating tokenizer...")
         log_memory("before_tokenizer")
@@ -157,6 +160,7 @@ class S3Token2Mel(torch.nn.Module):
             num_mid_blocks=12,
             num_heads=8,
             act_fn="gelu",
+            meanflow=self.meanflow,
         )
         log_memory("after_estimator")
 
@@ -288,9 +292,14 @@ class S3Token2Mel(torch.nn.Module):
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
+        n_cfm_timesteps=None,
+        noised_mels=None,
     ):
         """
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
+
+        n_cfm_timesteps=None uses the flow default (5 midpoint steps, or the value
+        resolved by S3Token2Wav.flow_inference for meanflow).
         """
         log_message(f"[FORWARD] Starting S3Token2Mel forward pass, finalize={finalize}")
         log_memory("start_s3token2mel_forward")
@@ -329,6 +338,9 @@ class S3Token2Mel(torch.nn.Module):
             token=speech_tokens,
             token_len=speech_token_lens,
             finalize=finalize,
+            n_timesteps=n_cfm_timesteps,
+            noised_mels=noised_mels,
+            meanflow=self.meanflow,
             **ref_dict,
         )
         # Explicitly delete flow_cache to prevent memory leak
@@ -347,11 +359,11 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
+    def __init__(self, meanflow=False):
         log_message("[INIT] Starting S3Token2Wav initialization")
         log_memory("start_s3token2wav_init")
 
-        super().__init__()
+        super().__init__(meanflow)
 
         log_message("[INIT] Creating F0 predictor...")
         log_memory("before_f0_predictor")
@@ -392,6 +404,8 @@ class S3Token2Wav(S3Token2Mel):
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
+        n_cfm_timesteps=None,
+        noised_mels=None,
     ):
         log_message(f"[FORWARD] Starting S3Token2Wav forward pass, finalize={finalize}")
         log_memory("start_s3token2wav_forward")
@@ -404,6 +418,8 @@ class S3Token2Wav(S3Token2Mel):
             ref_sr=ref_sr,
             ref_dict=ref_dict,
             finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
+            noised_mels=noised_mels,
         )
         log_memory("after_parent_forward")
 
@@ -445,10 +461,23 @@ class S3Token2Wav(S3Token2Mel):
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
+        n_cfm_timesteps=None,
     ):
         log_message(f"[FLOW_INFERENCE] Starting flow inference, finalize={finalize}")
         log_memory("start_flow_inference")
         log_tensor_info(speech_tokens, "flow_input_speech_tokens")
+
+        # Default steps: 2 meanflow Euler steps, else the flow default (5 midpoint).
+        if n_cfm_timesteps is None and self.meanflow:
+            n_cfm_timesteps = 2
+        noise = None
+        if self.meanflow:
+            # Upstream: fresh noise for the generated frames on every call.
+            flow = self.flow
+            n_mel = speech_tokens.size(-1) * flow.token_mel_ratio
+            if not finalize:
+                n_mel -= flow.pre_lookahead_len * flow.token_mel_ratio
+            noise = torch.randn(1, 80, n_mel, device=self.device)
 
         result = super().forward(
             speech_tokens,
@@ -456,6 +485,8 @@ class S3Token2Wav(S3Token2Mel):
             ref_sr=ref_sr,
             ref_dict=ref_dict,
             finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
+            noised_mels=noise,
         )
 
         log_memory("end_flow_inference")
@@ -527,6 +558,7 @@ class S3Token2Wav(S3Token2Mel):
         ref_dict: Optional[dict] = None,
         cache_source: torch.Tensor = None,  # NOTE: this arg is for streaming, it can probably be removed here
         finalize: bool = True,
+        n_cfm_timesteps=None,
     ):
         log_message(
             f"[INFERENCE] Starting full inference pipeline, finalize={finalize}"
@@ -553,6 +585,7 @@ class S3Token2Wav(S3Token2Mel):
             ref_sr=ref_sr,
             ref_dict=ref_dict,
             finalize=finalize,
+            n_cfm_timesteps=n_cfm_timesteps,
         )
 
         after_flow_inference = get_memory_mb()

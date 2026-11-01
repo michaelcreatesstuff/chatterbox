@@ -71,7 +71,10 @@ class AttentionMLX(nn.Module):
         heads: Number of attention heads.
         dim_head: Dimension per head.
         dropout: Dropout rate.
-        bias: Whether to use bias.
+        bias: Whether q/k/v projections use bias. False matches torch
+            BasicTransformerBlock (diffusers ``attention_bias=False``); the
+            checkpoints have no q/k/v biases, so True left random init biases.
+        out_bias: Whether the output projection uses bias (torch: True).
     """
 
     def __init__(
@@ -80,7 +83,8 @@ class AttentionMLX(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        bias: bool = True,  # Match PyTorch default
+        bias: bool = False,  # torch attention_bias default
+        out_bias: bool = True,
     ):
         super().__init__()
         self.heads = heads
@@ -91,7 +95,7 @@ class AttentionMLX(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
         self.to_k = nn.Linear(query_dim, inner_dim, bias=bias)
         self.to_v = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_out = nn.Linear(inner_dim, query_dim, bias=bias)
+        self.to_out = nn.Linear(inner_dim, query_dim, bias=out_bias)
 
     def __call__(
         self,
@@ -124,22 +128,13 @@ class AttentionMLX(nn.Module):
         k = mx.transpose(k, (0, 2, 1, 3))
         v = mx.transpose(v, (0, 2, 1, 3))
 
-        # Compute attention scores
-        scores = (q @ mx.transpose(k, (0, 1, 3, 2))) * self.scale
-
-        # Apply attention mask (already in bias form)
-        if attention_mask is not None:
-            # Ensure mask broadcasts correctly to [B, heads, T, T]
-            # If mask is [B, 1, T], expand to [B, 1, 1, T]
-            if attention_mask.ndim == 3:
-                attention_mask = mx.expand_dims(attention_mask, axis=2)
-            scores = scores + attention_mask
-
-        # Softmax in FP32 for stability
-        attn = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-
-        # Apply attention to values
-        out = attn @ v
+        # Fused attention (Metal SDPA kernel). The mask is additive (bias form);
+        # [B, 1, T] is expanded to [B, 1, 1, T] to broadcast over heads/queries.
+        if attention_mask is not None and attention_mask.ndim == 3:
+            attention_mask = mx.expand_dims(attention_mask, axis=2)
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=attention_mask
+        )
 
         # Reshape back
         out = mx.transpose(out, (0, 2, 1, 3))

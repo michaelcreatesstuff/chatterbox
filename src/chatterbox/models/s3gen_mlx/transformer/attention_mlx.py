@@ -210,18 +210,15 @@ class RelPositionMultiHeadedAttentionMLX(MultiHeadedAttentionMLX):
         batch_size, n_head, time1, time_pos = x.shape
 
         # Pad with zeros at the beginning
-        zero_pad = mx.zeros((batch_size, n_head, time1, 1))
+        zero_pad = mx.zeros((batch_size, n_head, time1, 1), dtype=x.dtype)
         x_padded = mx.concatenate([zero_pad, x], axis=-1)  # [B, H, T1, time_pos+1]
 
-        # Reshape to shift positions
-        x_padded = mx.reshape(
-            x_padded, (batch_size, n_head, -1, time1)
-        )  # [B, H, time_pos+1, T1]
-
-        # Slice to get the correct relative positions
-        # We want time1 positions for each query position
-        x = x_padded[:, :, 1 : time1 + 1, :]  # [B, H, T1, T1]
-        x = mx.transpose(x, (0, 1, 3, 2))  # [B, H, T1, T1]
+        # Same reinterpretation as the torch rel_shift: view the padded scores
+        # as (time_pos+1, time1), drop the first row, view back as
+        # (time1, time_pos) and keep relative positions 0..time1-1.
+        x_padded = mx.reshape(x_padded, (batch_size, n_head, time_pos + 1, time1))
+        x = mx.reshape(x_padded[:, :, 1:], (batch_size, n_head, time1, time_pos))
+        x = x[..., : time_pos // 2 + 1]  # [B, H, T1, T1]
 
         if zero_triu:
             # Create upper triangular mask and apply

@@ -170,8 +170,9 @@ class ResnetBlock1DMLX(nn.Module):
         self.dim_out = dim_out
 
         # MLP with explicit layers instead of Sequential
-        # PyTorch: mlp.0 = SiLU (no params), mlp.1 = Linear
-        self.mlp_0 = nn.SiLU()
+        # PyTorch: mlp.0 = Mish (no params), mlp.1 = Linear
+        # (was SiLU here, which diverged from the torch matcha ResnetBlock1D)
+        self.mlp_0 = nn.Mish()
         self.mlp_1 = nn.Linear(time_emb_dim, dim_out)
 
         if causal:
