@@ -10,8 +10,16 @@ import re
 
 
 _NUM_WORDS = {
-    0: 'zero', 1: 'one', 2: 'two', 3: 'three', 4: 'four',
-    5: 'five', 6: 'six', 7: 'seven', 8: 'eight', 9: 'nine',
+    0: "zero",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
 }
 
 _NON_ALPHA = re.compile(r"(\s?[^a-zA-Z]+\s?)")
@@ -19,7 +27,7 @@ _PHONE_NUM_CHARS = set(list("0123456789.+-()[] "))
 
 
 def is_phone_num(text: str) -> bool:
-    text = text.rstrip('.!?,;')
+    text = text.rstrip(".!?,;")
     if text.count(".") == 1:
         return False
     if any(c.isalpha() for c in text):
@@ -66,12 +74,14 @@ def _natural_phone_num_grouping(nums, max_natural_group=4):
         return [nums[:2], nums[2:]]
     if len(nums) == 8:
         return [nums[:2], nums[2:5], nums[5:]]
-    return _natural_phone_num_grouping(nums[:-max_natural_group], 3) + [nums[-max_natural_group:]]
+    return _natural_phone_num_grouping(nums[:-max_natural_group], 3) + [
+        nums[-max_natural_group:]
+    ]
 
 
 def _convert_phone_num_to_words(text: str) -> str:
-    original_punctuation = ''
-    while text and text[-1] in '.!?,;':
+    original_punctuation = ""
+    while text and text[-1] in ".!?,;":
         original_punctuation = text[-1] + original_punctuation
         text = text[:-1]
 
@@ -106,5 +116,7 @@ def _convert_phone_num_match_to_words(match: re.Match) -> str:
 def convert_phone_numbers_to_words(text: str) -> str:
     matches = sorted(_NON_ALPHA.finditer(text), key=lambda m: m.start(), reverse=True)
     for m in matches:
-        text = text[: m.start()] + _convert_phone_num_match_to_words(m) + text[m.end():]
+        text = (
+            text[: m.start()] + _convert_phone_num_match_to_words(m) + text[m.end() :]
+        )
     return text
