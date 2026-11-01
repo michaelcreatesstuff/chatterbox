@@ -43,7 +43,7 @@ each row has its own ``wpe`` positions and attention mask.
 
 import logging
 import secrets
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -481,9 +481,114 @@ class T3TurboMLX(nn.Module):
         Returns:
             Per-row int64 numpy arrays (see :func:`trim_at_stop`).
         """
-        n_real = len(text_tokens)
-        if n_real == 0:
+        if len(text_tokens) == 0:
             return []
+        steps: List[mx.array] = []
+        for steps, _ in self._decode_steps(
+            t3_cond,
+            text_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_gen_len=max_gen_len,
+            seeds=seeds,
+            max_gen_lens=max_gen_lens,
+            n_slots=n_slots,
+            compile_fn=compile_fn,
+            stats=stats,
+        ):
+            pass
+        out = np.array(mx.stack(steps, axis=1)).astype(np.int64)  # (B, 1 + n_steps)
+        stop = self.hp.stop_speech_token
+        return [trim_at_stop(out[i], stop) for i in range(len(text_tokens))]
+
+    def generate_stream(
+        self,
+        t3_cond: Union[T3CondMLX, mx.array],
+        text_tokens: mx.array,
+        *,
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        max_gen_len: int = MAX_GEN_LEN,
+        seed: Optional[int] = None,
+        block_tokens: int = 4,
+        compile_fn: bool = True,
+        stats: Optional[Dict] = None,
+    ) -> Iterator[np.ndarray]:
+        """Decode one utterance and yield its speech ids in blocks as they are ready.
+
+        The blocks concatenate to :meth:`generate`'s output for the same
+        arguments (same computation, read early). A block is yielded once at
+        least ``block_tokens`` new ids are evaluated (the last block can be
+        shorter). The ids are read two steps behind the decode front, so a
+        read does not stall the pipelined decode.
+
+        The decode is suspended while the caller handles a block. Do not run
+        another decode on this model until the generator is exhausted or
+        closed: it shares the KV cache.
+        """
+        stop = self.hp.stop_speech_token
+        block = max(1, int(block_tokens))
+        sent = 0  # ids yielded or dropped so far
+        stopped = False
+
+        def take(steps, end):
+            nonlocal sent, stopped
+            ids = np.array(mx.stack(steps[sent:end])[:, 0]).astype(np.int64)
+            first = 1 if sent == 0 else 0  # the first id never stops a row
+            hits = np.nonzero(ids[first:] == stop)[0]
+            if len(hits):
+                ids = ids[: first + hits[0]]
+                stopped = True
+            sent = end
+            return ids
+
+        for steps, ready in self._decode_steps(
+            t3_cond,
+            [text_tokens],
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_gen_len=max_gen_len,
+            seeds=[seed],
+            compile_fn=compile_fn,
+            stats=stats,
+        ):
+            if stopped:
+                continue  # the decode loop ends within PIPELINE_DEPTH steps
+            if ready - sent >= block or (ready == len(steps) and ready > sent):
+                ids = take(steps, ready)
+                if len(ids):
+                    yield ids
+
+    def _decode_steps(
+        self,
+        t3_cond: Union[T3CondMLX, mx.array],
+        text_tokens: Sequence[mx.array],
+        *,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+        max_gen_len: int,
+        seeds: Optional[Sequence[Optional[int]]],
+        max_gen_lens: Optional[Sequence[int]] = None,
+        n_slots: Optional[int] = None,
+        compile_fn: bool = True,
+        stats: Optional[Dict] = None,
+    ) -> Iterator[Tuple[List[mx.array], int]]:
+        """The batched decode loop of :meth:`generate_batch`, as a generator.
+
+        After each enqueued step it yields ``(steps, ready)``: ``steps`` is
+        the list of per-step ``(B,)`` token arrays so far (first token
+        included) and ``steps[:ready]`` are already evaluated. The last item
+        has ``ready == len(steps)``.
+        """
+        n_real = len(text_tokens)
         if seeds is None:
             seeds = [None] * n_real
         B = max(n_real, int(n_slots or 0))
@@ -558,6 +663,10 @@ class T3TurboMLX(nn.Module):
         finished = mx.array([i >= n_real for i in range(B)])
         tok = mx.where(finished, mx.array(stop, mx.int32), tok)
         steps = [tok]
+        if stats is not None:
+            stats["n_steps"] = 0
+            stats["prefix_len"] = col0
+            stats["batch_size"] = B
         # Sync once: steps 0 and 1 write the buffers the prefill wrote, which
         # would otherwise still be held by the prefill in flight (a copy each).
         mx.eval(tok, presence, finished, rng, cache.buffers)
@@ -609,10 +718,8 @@ class T3TurboMLX(nn.Module):
             mx.async_eval(
                 tok, presence, finished, rng, done, prev_k, prev_v, cache.buffers[k % 2]
             )
-
-        out = np.array(mx.stack(steps, axis=1)).astype(np.int64)  # (B, 1 + n_steps)
-        if stats is not None:
-            stats["n_steps"] = n_steps
-            stats["prefix_len"] = col0
-            stats["batch_size"] = B
-        return [trim_at_stop(out[i], stop) for i in range(n_real)]
+            if stats is not None:
+                stats["n_steps"] = n_steps
+            # steps[: k] are evaluated: step k - 2's flag was read above.
+            yield steps, max(1, k)
+        yield steps, len(steps)

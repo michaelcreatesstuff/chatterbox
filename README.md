@@ -156,6 +156,39 @@ Known limits:
 - Use a reference clip of clear speech, 10-15 s long. A non-speech clip (a tone or music) makes the model babble at the start of each sentence chunk.
 - `cfg_weight`, `exaggeration` and `min_p` have no effect, the same as upstream Turbo.
 
+#### Streaming (Nano and Turbo)
+
+Use `generate_stream()` to play audio before the full text is done. It yields 1-D float32 pieces at 24 kHz (`model.sr`). Play the pieces in order. Together they make one waveform.
+
+```python
+import numpy as np
+import sounddevice as sd  # any audio output works
+
+with sd.OutputStream(samplerate=model.sr, channels=1, dtype="float32") as out:
+    for piece in model.generate_stream("Hello! This is Chatterbox-Nano, streaming.", seed=0):
+        out.write(piece[:, None])
+print(model.last_timings["first_audio_s"])  # time from the call to the first piece
+```
+
+How it works:
+
+1. The text is split into the same sentence chunks as `generate()`.
+2. The first chunk decodes alone. While T3 decodes it, S3Gen converts token windows to audio. The first window has `first_chunk_tokens` tokens (default 25, 1 s of audio). The next window has `chunk_tokens` tokens (default 50). Each window after that has double the tokens, up to 200.
+3. Each window also converts `context_tokens` tokens (default 50) on its left and decodes `lookahead_tokens` tokens (default 5) past its end. Consecutive windows crossfade over 40 ms. This keeps the joins clean.
+4. The other chunks decode in batch groups of up to `max_batch_chunks` chunks. Each chunk is yielded when its audio is ready.
+5. The chunks crossfade the same way as in `generate()`.
+
+Options:
+
+- `first_chunk_tokens=0`: turn off token windows. The first chunk is then yielded whole.
+- `watermark=True` (default): each piece gets its own Perth watermark. The watermarker sees the last 0.25 s of the previous piece as context.
+
+Rules:
+
+- Exhaust the generator or call `close()` on it. The generator holds the model lock until then, so other threads wait.
+- Do not call `generate()`, `generate_stream()`, `prepare_conditionals()` or `release_caches()` on the same model inside the loop. These calls raise `RuntimeError`, because the open stream uses the same KV cache.
+- Do not expect the same samples as `generate()` with the same seed. The window joins differ, and the first chunk decodes at batch size 1. A first chunk that ends before its first window gives the same audio as `generate()`.
+
 ### Chatterbox-Flash (English)
 
 [Chatterbox-Flash](https://huggingface.co/ResembleAI/chatterbox-flash) replaces the autoregressive T3 decoder with a block-diffusion decoder. It unmasks a block of speech tokens in parallel per step. This port runs the full T3 loop and the meanflow S3Gen vocoder in MLX.

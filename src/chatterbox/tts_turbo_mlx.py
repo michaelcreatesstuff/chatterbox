@@ -26,6 +26,13 @@ groups (:func:`~chatterbox.tts_flash_mlx.plan_chunks`); up to
 ``max_batch_chunks`` groups decode concurrently as rows of one T3 batch, are
 vocoded one by one and crossfaded. The watermark is applied once, to the
 final waveform.
+
+:meth:`ChatterboxTurboMLX.generate_stream` yields the same pipeline's audio
+in pieces: the first chunk is vocoded on growing token windows while T3 is
+still decoding it (see :class:`_WindowVocoder`); the other chunks decode in
+batch groups and each is yielded when it is vocoded. Pieces join with the
+same crossfades as :meth:`~ChatterboxTurboMLX.generate` (:class:`_ChunkJoiner`)
+and are watermarked one by one.
 """
 
 import logging
@@ -33,7 +40,7 @@ import math
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Iterator, List, Optional, Union
 
 import numpy as np
 
@@ -97,6 +104,23 @@ SPEECH_VOCAB = 6561
 TEXT_VOCAB = 50276
 
 DEFAULT_MAX_BATCH_CHUNKS = 8
+
+# --- Streaming (generate_stream) ------------------------------------------ #
+# One S3 token is 2 mel frames of 480 samples at 24 kHz (40 ms).
+SAMPLES_PER_TOKEN = 960
+# S3Gen's pre-lookahead: a non-final flow call drops the last 3 tokens' mel.
+S3GEN_PRE_LOOKAHEAD = 3
+STREAM_FIRST_CHUNK_TOKENS = 25  # first window: 1 s of audio
+STREAM_CHUNK_TOKENS = 50  # second window; later windows double ...
+STREAM_MAX_CHUNK_TOKENS = 200  # ... up to this
+STREAM_CONTEXT_TOKENS = 50  # tokens re-vocoded left of a window's new audio
+STREAM_LOOKAHEAD_TOKENS = 5  # tokens decoded right of a window's emitted end
+# Raised-cosine crossfade between consecutive windows of one chunk.
+WINDOW_XFADE = SAMPLES_PER_TOKEN
+# T3 ids are read in blocks of this many tokens.
+STREAM_BLOCK_TOKENS = 4
+# Already-watermarked audio fed back as left context to the next piece.
+WATERMARK_CONTEXT_S = 0.25
 
 # Per-chunk decode cap with split_sentences: 1.5x the Flash budget estimate
 # (12.5 tokens per word + 25) plus 25 tokens. Over 272 chunks with 4 real
@@ -191,6 +215,222 @@ def ref_dict_to_mlx(ref_dict: dict) -> dict:
     }
 
 
+class _ChunkJoiner:
+    """Incremental :func:`~chatterbox.generation_utils.crossfade_chunks`.
+
+    With more than one chunk, every chunk loses its first 20 ms (S3Gen's
+    silent fade-in), consecutive chunks overlap by ``overlap_duration`` with
+    linear fades, and the last 3 ms fade to 10 %. The last ``overlap``
+    samples of the output are held back until the next chunk (or
+    :meth:`finish`) decides how they end. One chunk passes through as is.
+    """
+
+    def __init__(self, n_chunks: int, sr: int, overlap_duration: float):
+        multi = n_chunks > 1
+        self.trim = sr // 50 if multi else 0
+        self.ov = int(overlap_duration * sr) if multi else 0
+        self.tail = sr // 333 if multi else 0
+        self.fade_out = np.linspace(1, 0, self.ov, dtype=np.float32)
+        self.fade_in = np.linspace(0, 1, self.ov, dtype=np.float32)
+        self._empty = np.zeros((0,), dtype=np.float32)
+        self.held = self._empty  # output end, kept for the next crossfade
+        self.head = self._empty  # current chunk's start, waiting to crossfade
+        self.ready = self._empty  # output released by begin_chunk
+        self.to_trim = 0
+        self.mixing = False
+
+    def begin_chunk(self) -> None:
+        if self.mixing:  # last chunk was too short to crossfade
+            self.held = np.concatenate([self.held, self.head])
+            self.head = self._empty
+        if self.ov and len(self.held) > self.ov:
+            self.ready = np.concatenate([self.ready, self.held[: -self.ov]])
+            self.held = self.held[-self.ov :]
+        self.to_trim = self.trim
+        self.mixing = self.ov > 0 and len(self.held) == self.ov
+
+    def push(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        cut = min(self.to_trim, len(x))
+        x = x[cut:]
+        self.to_trim -= cut
+        if self.mixing:
+            self.head = np.concatenate([self.head, x])
+            if len(self.head) < self.ov:
+                return self._take_ready()
+            mixed = self.held * self.fade_out + self.head[: self.ov] * self.fade_in
+            x = np.concatenate([mixed, self.head[self.ov :]])
+            self.held = self.head = self._empty
+            self.mixing = False
+        y = np.concatenate([self._take_ready(), self.held, x])
+        if self.ov:
+            k = min(self.ov, len(y))
+            self.held, y = y[len(y) - k :], y[: len(y) - k]
+        return y
+
+    def finish(self) -> np.ndarray:
+        y = np.concatenate([self._take_ready(), self.held, self.head])
+        self.held = self.head = self._empty
+        self.mixing = False
+        n = min(self.tail, len(y))
+        if n:
+            y = y.copy()
+            y[-n:] *= np.linspace(1.0, 0.1, n, dtype=np.float32)
+        return y
+
+    def _take_ready(self) -> np.ndarray:
+        y, self.ready = self.ready, self._empty
+        return y
+
+
+class _WindowVocoder:
+    """Vocode one chunk on growing token windows while T3 still decodes it.
+
+    Window ``w`` vocodes the tokens ``[start, n)`` decoded so far, where
+    ``start`` is ``context_tokens`` left of the audio already emitted. S3Gen
+    runs non-final (it drops the last 3 tokens' mel), and the window emits
+    audio up to ``lookahead_tokens`` before ``n``. The last
+    :data:`WINDOW_XFADE` samples of a window are crossfaded with the same
+    samples of the next window. The next window reuses the previous window's
+    HiFiGAN source signal up to that crossfade end (CosyVoice's
+    ``cache_source``), and every window reads the flow noise of a frame from
+    one per-chunk noise buffer, so overlapping samples match closely. The
+    final window (T3 finished, the 3 silence tokens appended) runs S3Gen in
+    final mode and emits the rest. A chunk that ends before its first window
+    is vocoded once, exactly as :meth:`ChatterboxTurboMLX.generate` does.
+    """
+
+    def __init__(
+        self,
+        tts: "ChatterboxTurboMLX",
+        *,
+        seed: Optional[int],
+        n_cfm_timesteps: int,
+        max_tokens: int,
+        first_chunk_tokens: int,
+        chunk_tokens: int,
+        context_tokens: int,
+        lookahead_tokens: int,
+    ):
+        self.tts = tts
+        self.seed = seed
+        self.n_cfm = n_cfm_timesteps
+        self.max_tokens = max_tokens
+        self.size = first_chunk_tokens
+        self.chunk_tokens = chunk_tokens
+        self.context = context_tokens
+        self.lookahead = lookahead_tokens
+        self.tokens: List[int] = []
+        self.emitted = 0  # chunk samples already emitted
+        self.tail: Optional[np.ndarray] = None  # last window's [emitted, +X)
+        self.src = None  # last window's HiFiGAN source (1, 1, N)
+        self.src_start = 0  # its first chunk sample
+        self.n_windows = 0
+        self._noise = None
+        x = WINDOW_XFADE
+        t = np.arange(x, dtype=np.float32) / x
+        self.fade_in = (0.5 - 0.5 * np.cos(np.pi * t)).astype(np.float32)
+        self.fade_out = (1.0 - self.fade_in).astype(np.float32)
+
+    def feed(self, ids: np.ndarray) -> Iterator[np.ndarray]:
+        """Add T3 ids; yield the audio of every window they complete."""
+        ids = np.asarray(ids).reshape(-1)
+        self.tokens.extend(int(t) for t in ids[ids < SPEECH_VOCAB])
+        while len(self.tokens) >= self._target():
+            before = self._progress()
+            yield self._window(final=False)
+            if self._progress() <= before:  # no progress (short vocoder output)
+                break
+            self.size = (
+                self.chunk_tokens
+                if self.n_windows == 1
+                else min(2 * self.size, max(self.chunk_tokens, STREAM_MAX_CHUNK_TOKENS))
+            )
+
+    def finish(self) -> np.ndarray:
+        """Append the silence tokens and return the chunk's remaining audio."""
+        self.tokens.extend([S3GEN_SIL] * 3)
+        return self._window(final=True)
+
+    def _progress(self) -> int:
+        return self.emitted + (0 if self.tail is None else len(self.tail))
+
+    def _target(self) -> int:
+        return self._progress() // SAMPLES_PER_TOKEN + self.size + self.lookahead
+
+    def _seed_window(self) -> None:
+        if self.seed is not None:
+            sd = int(self.seed) + 7919 * self.n_windows
+            mx.random.seed(sd % 2**32)
+
+    def _noise_slice(self, start_frame: int, n_frames: int):
+        ref = self.tts._ref_dict
+        if 2 * int(ref["prompt_token_len"]) != int(ref["prompt_feat_len"]):
+            return None
+        if self._noise is None:
+            shape = (1, int(ref["prompt_feat"].shape[-1]), 2 * (self.max_tokens + 8))
+            key = None
+            if self.seed is not None:
+                key = mx.random.key((int(self.seed) + 0x5EED) % 2**32)
+            self._noise = mx.random.normal(shape, key=key)
+        if start_frame + n_frames > self._noise.shape[2]:
+            return None
+        return self._noise[:, :, start_frame : start_frame + n_frames]
+
+    def _window(self, final: bool) -> np.ndarray:
+        tts = self.tts
+        T, X = SAMPLES_PER_TOKEN, WINDOW_XFADE
+        tokens = np.asarray(self.tokens, dtype=np.int64)
+        n = len(tokens)
+        if final and self.n_windows == 0:
+            self.n_windows = 1
+            return tts._vocode(tokens, self.n_cfm, self.seed)
+
+        start = 0 if self.emitted == 0 else max(0, self.emitted // T - self.context)
+        win = tokens[start:]
+        n_frames = 2 * len(win) - (0 if final else 2 * S3GEN_PRE_LOOKAHEAD)
+        self._seed_window()
+        noise = self._noise_slice(2 * start, n_frames)
+        mel = tts._token2mel(win, final, self.n_cfm, noise)
+
+        cache = None
+        if self.src is not None:
+            lo = start * T - self.src_start
+            hi = self.emitted + X - self.src_start
+            hi = min(hi, self.src.shape[2], lo + mel.shape[-1] * (T // 2))
+            if hi > lo >= 0:
+                cache = self.src[:, :, lo:hi]
+        wav, src = tts.s3gen.hift_inference(mel, cache)
+        wav = np.array(wav.astype(mx.float32)).reshape(-1)
+        trim_fade = getattr(tts.s3gen, "trim_fade", None)
+        if start == 0 and trim_fade is not None:
+            fade = np.array(trim_fade, dtype=np.float32).reshape(-1)
+            if len(wav) >= len(fade):
+                wav[: len(fade)] *= fade
+        if mx.get_cache_memory() > tts.mlx_cache_limit:
+            mx.clear_cache()
+        self.n_windows += 1
+
+        w0 = start * T
+        end = w0 + len(wav)
+        cut = end if final else min(end, (n - self.lookahead) * T)
+        seg = wav[max(0, self.emitted - w0) : max(0, cut - w0)].copy()
+        if self.tail is not None:
+            k = min(len(self.tail), len(seg))
+            seg[:k] = self.tail[:k] * self.fade_out[:k] + seg[:k] * self.fade_in[:k]
+            if k < len(self.tail):  # window shorter than the crossfade
+                seg = np.concatenate([seg, self.tail[k:]])
+        self.tail = None
+        if final or len(seg) <= X:
+            out = seg
+            self.emitted += len(seg)
+        else:
+            out, self.tail = seg[:-X], seg[-X:].copy()
+            self.emitted += len(out)
+        self.src, self.src_start = src, w0
+        return out
+
+
 class ChatterboxTurboMLX:
     """Chatterbox-Turbo (or Nano) text-to-speech with the T3 decoder on MLX."""
 
@@ -236,6 +476,8 @@ class ChatterboxTurboMLX:
         self.last_timings: dict = {}
         self._lock = threading.RLock()
         self._watermarker = None
+        # Open generate_stream generators (they hold the lock while open).
+        self._stream_active = 0
 
         # Per-voice conditioning (set by prepare_conditionals / conds.pt)
         self._t3_cond_emb: Optional[mx.array] = None
@@ -370,10 +612,21 @@ class ChatterboxTurboMLX:
         Weights and conditioning stay; the next :meth:`generate` rebuilds
         the cache.
         """
+        self._check_no_stream()
         self.t3.release_caches()
+
+    def _check_no_stream(self) -> None:
+        # Another thread waits on the lock; this one re-enters it. A stream
+        # suspended mid-decode shares T3's KV cache and the conditioning.
+        if self._stream_active:
+            raise RuntimeError(
+                "A generate_stream() generator is open on this instance; "
+                "exhaust or close() it first."
+            )
 
     def _set_conditionals(self, speaker_emb, prompt_tokens, ref_dict) -> None:
         """Store T3 conditioning embeddings and the MLX S3Gen reference dict."""
+        self._check_no_stream()
         t3_cond = T3CondMLX(
             speaker_emb=mx.array(np.asarray(speaker_emb, dtype=np.float32)),
             cond_prompt_speech_tokens=(
@@ -417,6 +670,7 @@ class ChatterboxTurboMLX:
         tokens, the whole 16 kHz wav the VE embedding and the first 10 s at
         24 kHz the S3Gen reference dict. ``exaggeration`` is unused by Turbo.
         """
+        self._check_no_stream()
         s3gen_ref_wav, _sr = librosa.load(str(wav_fpath), sr=S3GEN_SR)
         if len(s3gen_ref_wav) / _sr <= 5.0:
             raise ValueError("Audio prompt must be longer than 5 seconds!")
@@ -468,6 +722,40 @@ class ChatterboxTurboMLX:
         if mx.get_cache_memory() > self.mlx_cache_limit:
             mx.clear_cache()
         return wav
+
+    def _token2mel(self, tokens: np.ndarray, finalize: bool, n_cfm_timesteps, noise):
+        """S3Gen flow only (tokens -> mel ``(1, 80, F)``), optionally with given noise."""
+        from .models.s3gen_mlx.s3gen_mlx import S3Token2MelMLX
+
+        toks = mx.array(np.asarray(tokens)[None].astype(np.int32))
+        if noise is not None and isinstance(self.s3gen, S3Token2MelMLX):
+            mel = S3Token2MelMLX.__call__(
+                self.s3gen,
+                toks,
+                self._ref_dict,
+                finalize,
+                n_cfm_timesteps=n_cfm_timesteps,
+                noised_mels=noise,
+            )
+            mx.eval(mel)
+            return mel
+        return self.s3gen.flow_inference(
+            toks, self._ref_dict, finalize, n_cfm_timesteps=n_cfm_timesteps
+        )
+
+    def _prepare_call(
+        self, audio_prompt_path, norm_loudness, exaggeration, cfg_weight, min_p
+    ) -> None:
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, norm_loudness=norm_loudness)
+        if self._t3_cond_emb is None:
+            raise ValueError("Call prepare_conditionals() first.")
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning(
+                "CFG, min_p and exaggeration are not supported by the %s version "
+                "and will be ignored.",
+                self.model_label,
+            )
 
     def _watermark(self, wav: np.ndarray) -> np.ndarray:
         # Perth runs torch ops; with autograd on it leaves tensors with a
@@ -531,16 +819,10 @@ class ChatterboxTurboMLX:
             exaggeration, cfg_weight, min_p: Not supported by Turbo (warned
                 and ignored, as upstream).
         """
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, norm_loudness=norm_loudness)
-        if self._t3_cond_emb is None:
-            raise ValueError("Call prepare_conditionals() first.")
-        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
-            logger.warning(
-                "CFG, min_p and exaggeration are not supported by the %s version "
-                "and will be ignored.",
-                self.model_label,
-            )
+        self._check_no_stream()
+        self._prepare_call(
+            audio_prompt_path, norm_loudness, exaggeration, cfg_weight, min_p
+        )
         if not text or not text.strip():
             self.last_timings = {"n_chunks": 0}
             return np.zeros((0,), dtype=np.float32)
@@ -625,3 +907,264 @@ class ChatterboxTurboMLX:
             "batch_sizes": batch_sizes,
         }
         return wav
+
+    def generate_stream(
+        self,
+        text: str,
+        *,
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        seed: Optional[int] = None,
+        split_sentences: bool = True,
+        max_batch_chunks: int = DEFAULT_MAX_BATCH_CHUNKS,
+        overlap_duration: float = 0.05,
+        language: str = "en",
+        watermark: bool = True,
+        n_cfm_timesteps: int = 2,
+        max_gen_len: int = MAX_GEN_LEN,
+        first_chunk_tokens: int = STREAM_FIRST_CHUNK_TOKENS,
+        chunk_tokens: int = STREAM_CHUNK_TOKENS,
+        context_tokens: int = STREAM_CONTEXT_TOKENS,
+        lookahead_tokens: int = STREAM_LOOKAHEAD_TOKENS,
+        audio_prompt_path: Optional[Union[str, Path]] = None,
+        norm_loudness: bool = True,
+        exaggeration: float = 0.0,
+        cfg_weight: float = 0.0,
+        min_p: float = 0.0,
+    ) -> Iterator[np.ndarray]:
+        """Synthesize ``text`` and yield 1-D float32 pieces at :attr:`sr` as they are ready.
+
+        The pieces concatenate to one waveform; play them in order. The
+        arguments shared with :meth:`generate` mean the same. The text is cut
+        into the same chunks (:func:`~chatterbox.tts_flash_mlx.plan_chunks`).
+
+        * Chunk 0 decodes alone. While T3 decodes it, S3Gen vocodes token
+          windows: the first after ``first_chunk_tokens`` tokens (plus
+          ``lookahead_tokens``), the next after ``chunk_tokens`` more, then
+          windows double up to :data:`STREAM_MAX_CHUNK_TOKENS`. Each window
+          also re-vocodes ``context_tokens`` tokens on its left (see
+          :class:`_WindowVocoder`). ``first_chunk_tokens=0`` turns this off:
+          chunk 0 is then yielded whole when it is vocoded.
+        * The other chunks decode in batch groups of up to
+          ``max_batch_chunks`` rows; each chunk is yielded when it is vocoded.
+
+        The audio is not bit-identical to :meth:`generate`: chunk 0's window
+        joins differ, and chunk 0 decodes at batch size 1 (T3 rows at another
+        batch size can round differently). A chunk that ends before its first
+        window is vocoded exactly as in :meth:`generate`.
+
+        ``watermark`` applies the Perth watermark to each piece, with the end
+        of the previous piece as left context (:data:`WATERMARK_CONTEXT_S`).
+
+        The generator holds the instance lock until it is exhausted or
+        closed: other threads wait, and calling :meth:`generate`,
+        :meth:`generate_stream` or a conditioning method of this instance
+        from the loop raises ``RuntimeError``.
+
+        :attr:`last_timings` is set when the generator ends: the keys of
+        :meth:`generate` plus ``first_audio_s`` (call to first piece),
+        ``n_pieces`` and ``n_windows`` (S3Gen calls for chunk 0).
+        """
+        with self._lock:
+            self._check_no_stream()
+            first_chunk_tokens = int(first_chunk_tokens)
+            if first_chunk_tokens and first_chunk_tokens < 2:
+                raise ValueError("first_chunk_tokens must be 0 or >= 2")
+            if lookahead_tokens < S3GEN_PRE_LOOKAHEAD:
+                raise ValueError(f"lookahead_tokens must be >= {S3GEN_PRE_LOOKAHEAD}")
+            t_start = time.perf_counter()
+            self._prepare_call(
+                audio_prompt_path, norm_loudness, exaggeration, cfg_weight, min_p
+            )
+            if not text or not text.strip():
+                self.last_timings = {"n_chunks": 0}
+                return
+
+            pieces = plan_chunks(text, language=language) if split_sentences else [text]
+            seeds = [
+                None if seed is None else int(seed) + i for i in range(len(pieces))
+            ]
+            caps = [
+                (
+                    chunk_speech_cap(p, max_gen_len)
+                    if split_sentences
+                    else int(max_gen_len)
+                )
+                for p in pieces
+            ]
+            t3_kwargs = dict(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            joiner = _ChunkJoiner(len(pieces), self.sr, overlap_duration)
+            wm_ctx = np.zeros((0,), dtype=np.float32)
+            wm_ctx_len = int(WATERMARK_CONTEXT_S * self.sr)
+            t = {
+                "t3_s": 0.0,
+                "s3gen_s": 0.0,
+                "watermark_s": 0.0,
+                "n_speech_tokens": 0,
+                "n_chunks": len(pieces),
+                "n_groups": 0,
+                "n_steps": 0,
+                "batch_sizes": [],
+                "first_audio_s": None,
+                "n_pieces": 0,
+                "n_windows": 0,
+            }
+
+            def out(wav: np.ndarray, last: bool) -> np.ndarray:
+                nonlocal wm_ctx
+                y = joiner.push(wav)
+                if last:
+                    y = np.concatenate([y, joiner.finish()])
+                if watermark and len(y):
+                    t0 = time.perf_counter()
+                    # Perth sees the previous (unwatermarked) audio as context.
+                    x = np.concatenate([wm_ctx, y])
+                    w = self._watermark(x)[len(wm_ctx) :]
+                    if len(w) < len(y):
+                        w = np.concatenate([w, y[len(w) :]])
+                    wm_ctx = x[-wm_ctx_len:]
+                    y = w[: len(y)].astype(np.float32, copy=False)
+                    t["watermark_s"] += time.perf_counter() - t0
+                if len(y):
+                    t["n_pieces"] += 1
+                    if t["first_audio_s"] is None:
+                        t["first_audio_s"] = time.perf_counter() - t_start
+                return y
+
+            self._stream_active += 1
+            try:
+                rest = list(range(1, len(pieces)))
+                if first_chunk_tokens:
+                    joiner.begin_chunk()
+                    yield from self._stream_first_chunk(
+                        pieces[0],
+                        seeds[0],
+                        caps[0],
+                        t3_kwargs,
+                        n_cfm_timesteps,
+                        t,
+                        out,
+                        last=not rest,
+                        first_chunk_tokens=first_chunk_tokens,
+                        chunk_tokens=max(1, int(chunk_tokens)),
+                        context_tokens=max(0, int(context_tokens)),
+                        lookahead_tokens=int(lookahead_tokens),
+                    )
+                # Chunk 0 (when not token-streamed) decodes alone; the rest
+                # in equal groups that share one cache size.
+                rest_groups = []
+                if rest:
+                    mb = max(1, int(max_batch_chunks))
+                    rest_groups = [
+                        [rest[i] for i in g] for g in self._groups(len(rest), mb)
+                    ]
+                rest_slots = len(rest_groups[0]) if rest_groups else 1
+                groups = ([] if first_chunk_tokens else [[0]]) + rest_groups
+                for group in groups:
+                    stats: dict = {}
+                    t0 = time.perf_counter()
+                    n_slots = 1 if group == [0] else rest_slots
+                    tokens = self.t3.generate_batch(
+                        self._t3_cond_emb,
+                        [self._encode_text(pieces[i]) for i in group],
+                        seeds=[seeds[i] for i in group],
+                        max_gen_lens=[caps[i] for i in group],
+                        max_gen_len=max_gen_len,
+                        n_slots=n_slots,
+                        stats=stats,
+                        **t3_kwargs,
+                    )
+                    t["t3_s"] += time.perf_counter() - t0
+                    t["n_steps"] += stats.get("n_steps", 0)
+                    t["n_groups"] += 1
+                    t["batch_sizes"].append(stats.get("batch_size", len(group)))
+                    for i, toks in zip(group, tokens):
+                        speech = postprocess_speech_tokens(toks)
+                        t["n_speech_tokens"] += len(speech) - 3
+                        if len(speech) == 3:
+                            logger.warning(
+                                "Turbo T3 produced no speech tokens for %r",
+                                pieces[i][:60],
+                            )
+                        t1 = time.perf_counter()
+                        wav = self._vocode(speech, n_cfm_timesteps, seeds[i])
+                        t["s3gen_s"] += time.perf_counter() - t1
+                        joiner.begin_chunk()
+                        y = out(wav, last=i == len(pieces) - 1)
+                        if len(y):
+                            yield y
+            finally:
+                self._stream_active -= 1
+                self.last_timings = t
+
+    def _stream_first_chunk(
+        self,
+        text: str,
+        seed: Optional[int],
+        cap: int,
+        t3_kwargs: dict,
+        n_cfm_timesteps: int,
+        t: dict,
+        out,
+        *,
+        last: bool,
+        first_chunk_tokens: int,
+        chunk_tokens: int,
+        context_tokens: int,
+        lookahead_tokens: int,
+    ) -> Iterator[np.ndarray]:
+        """Token-level streaming of one chunk (see :meth:`generate_stream`)."""
+        voc = _WindowVocoder(
+            self,
+            seed=seed,
+            n_cfm_timesteps=n_cfm_timesteps,
+            max_tokens=cap + 1,
+            first_chunk_tokens=first_chunk_tokens,
+            chunk_tokens=chunk_tokens,
+            context_tokens=context_tokens,
+            lookahead_tokens=lookahead_tokens,
+        )
+        stats: dict = {}
+        blocks = self.t3.generate_stream(
+            self._t3_cond_emb,
+            self._encode_text(text),
+            seed=seed,
+            max_gen_len=cap,
+            block_tokens=STREAM_BLOCK_TOKENS,
+            stats=stats,
+            **t3_kwargs,
+        )
+        n_ids = 0
+        t0 = time.perf_counter()
+        for ids in blocks:
+            n_ids += int(np.sum(np.asarray(ids) < SPEECH_VOCAB))
+            t["t3_s"] += time.perf_counter() - t0
+            t1 = time.perf_counter()
+            wavs = list(voc.feed(ids))
+            t["s3gen_s"] += time.perf_counter() - t1
+            for wav in wavs:
+                y = out(wav, last=False)
+                if len(y):
+                    yield y
+            t0 = time.perf_counter()
+        t["t3_s"] += time.perf_counter() - t0
+        t["n_steps"] += stats.get("n_steps", 0)
+        t["n_groups"] += 1
+        t["batch_sizes"].append(stats.get("batch_size", 1))
+        t["n_speech_tokens"] += n_ids
+        if n_ids == 0:
+            logger.warning("Turbo T3 produced no speech tokens for %r", text[:60])
+        t1 = time.perf_counter()
+        wav = voc.finish()
+        t["s3gen_s"] += time.perf_counter() - t1
+        t["n_windows"] = voc.n_windows
+        y = out(wav, last=last)
+        if len(y):
+            yield y
