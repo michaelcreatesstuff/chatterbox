@@ -48,7 +48,12 @@ from .configs import GPT2ConfigMLX
 def is_conv1d_weight(key: str) -> bool:
     """True for HF GPT-2 ``Conv1D`` weights, stored ``(in, out)``."""
     return key.startswith("tfmr.h.") and key.endswith(
-        ("attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight", "mlp.c_proj.weight")
+        (
+            "attn.c_attn.weight",
+            "attn.c_proj.weight",
+            "mlp.c_fc.weight",
+            "mlp.c_proj.weight",
+        )
     )
 
 
@@ -184,7 +189,11 @@ class GPT2Attention(nn.Module):
         keys = mx.slice_update(keys, k, col, axes=(2,))
         values = mx.slice_update(values, v, col, axes=(2,))
         out = mx.fast.scaled_dot_product_attention(
-            q, keys[:, :, :attn_len], values[:, :, :attn_len], scale=self.scale, mask=mask
+            q,
+            keys[:, :, :attn_len],
+            values[:, :, :attn_len],
+            scale=self.scale,
+            mask=mask,
         )
         return self.out(out), k, v, keys, values
 
@@ -220,7 +229,9 @@ class GPT2ModelMLX(nn.Module):
         self.h = [GPT2Block(config) for _ in range(config.n_layer)]
         self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
-    def make_cache(self, batch_size: int, max_seq: int, dtype: mx.Dtype) -> TurboKVCache:
+    def make_cache(
+        self, batch_size: int, max_seq: int, dtype: mx.Dtype
+    ) -> TurboKVCache:
         cfg = self.config
         return TurboKVCache(
             cfg.n_layer, batch_size, cfg.n_head, cfg.head_dim, max_seq, dtype

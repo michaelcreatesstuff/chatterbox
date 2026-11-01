@@ -149,7 +149,9 @@ def punc_norm(text: str) -> str:
     return text
 
 
-def normalize_loudness(wav: np.ndarray, sr: int, target_lufs: float = -27) -> np.ndarray:
+def normalize_loudness(
+    wav: np.ndarray, sr: int, target_lufs: float = -27
+) -> np.ndarray:
     """Upstream ``ChatterboxTurboTTS.norm_loudness``."""
     try:
         import pyloudnorm as ln
@@ -392,7 +394,9 @@ class ChatterboxTurboMLX:
         t3 = conds["t3"]
         tokens = t3.get("cond_prompt_speech_tokens")
         if t3.get("cond_prompt_speech_emb") is not None:
-            logger.warning("conds.pt cond_prompt_speech_emb ignored; re-embedding tokens")
+            logger.warning(
+                "conds.pt cond_prompt_speech_emb ignored; re-embedding tokens"
+            )
         self._set_conditionals(
             t3["speaker_emb"].float().cpu().numpy(),
             None if tokens is None else torch.atleast_2d(tokens).cpu().numpy(),
@@ -449,7 +453,9 @@ class ChatterboxTurboMLX:
         ids = np.asarray(enc["input_ids"]).reshape(1, -1)
         return mx.array(ids.astype(np.int32))
 
-    def _vocode(self, speech_tokens: np.ndarray, n_cfm_timesteps: int, seed) -> np.ndarray:
+    def _vocode(
+        self, speech_tokens: np.ndarray, n_cfm_timesteps: int, seed
+    ) -> np.ndarray:
         if seed is not None:
             mx.random.seed(int(seed))
         kwargs = {"finalize": True}
@@ -582,7 +588,9 @@ class ChatterboxTurboMLX:
                 speech = postprocess_speech_tokens(toks)
                 n_tokens += len(speech) - 3
                 if len(speech) == 3:
-                    logger.warning("Turbo T3 produced no speech tokens for %r", pieces[i][:60])
+                    logger.warning(
+                        "Turbo T3 produced no speech tokens for %r", pieces[i][:60]
+                    )
                 t1 = time.perf_counter()
                 wavs.append(self._vocode(speech, n_cfm_timesteps, seeds[i]))
                 s3gen_s += time.perf_counter() - t1

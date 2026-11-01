@@ -326,27 +326,75 @@ class T3TurboMLX(nn.Module):
         whose ``caps[b]`` decode steps are used up (``step >= caps[b]``, with
         ``step`` the ``(1,)`` int32 step index) is finished like at EOS.
         """
-        key = ("decode", batch_size, lc, attn_len, tuple(sorted(flags.items())), compile_fn)
+        key = (
+            "decode",
+            batch_size,
+            lc,
+            attn_len,
+            tuple(sorted(flags.items())),
+            compile_fn,
+        )
         fn = self._fns.get(key)
         if fn is not None:
             return fn
         stop = self.hp.stop_speech_token
 
-        def fn(tok, col, prev_col, pad, step, caps, presence, finished, keys,
-               temp, top_p, penalty, prev_k, prev_v, buf_k, buf_v):
+        def fn(
+            tok,
+            col,
+            prev_col,
+            pad,
+            step,
+            caps,
+            presence,
+            finished,
+            keys,
+            temp,
+            top_p,
+            penalty,
+            prev_k,
+            prev_v,
+            buf_k,
+            buf_v,
+        ):
             finished = finished | (step >= caps)
             emb = self.speech_emb(tok)[:, None].astype(self.dtype)
             mask = decode_mask(pad, lc, col, attn_len)
             hidden, own_k, own_v, buf_k, buf_v = self.tfmr.decode(
-                emb, col - pad, col, prev_col, prev_k, prev_v, mask,
-                buf_k, buf_v, attn_len,
+                emb,
+                col - pad,
+                col,
+                prev_col,
+                prev_k,
+                prev_v,
+                mask,
+                buf_k,
+                buf_v,
+                attn_len,
             )
             logits = self.speech_head(hidden[:, 0]).astype(mx.float32)
             tok, presence, finished, keys = sample_tokens(
-                logits, presence, finished, keys, temp, top_p, penalty,
-                stop_id=stop, **flags,
+                logits,
+                presence,
+                finished,
+                keys,
+                temp,
+                top_p,
+                penalty,
+                stop_id=stop,
+                **flags,
             )
-            return tok, presence, finished, keys, finished.all(), own_k, own_v, buf_k, buf_v
+            return (
+                tok,
+                presence,
+                finished,
+                keys,
+                finished.all(),
+                own_k,
+                own_v,
+                buf_k,
+                buf_v,
+            )
 
         if compile_fn:
             fn = mx.compile(fn)
@@ -474,8 +522,13 @@ class T3TurboMLX(nn.Module):
         buffers = [cache.take(0), cache.take(1)]
         try:
             hidden, buffers = self.tfmr.prefill(
-                prefix, positions, prefill_mask(pad_arr, lc, lr), cond_k, cond_v,
-                buffers, eval_layers=B * lr > PREFILL_EVAL_TOKENS,
+                prefix,
+                positions,
+                prefill_mask(pad_arr, lc, lr),
+                cond_k,
+                cond_v,
+                buffers,
+                eval_layers=B * lr > PREFILL_EVAL_TOKENS,
             )
         finally:
             cache.buffers = buffers
@@ -493,8 +546,13 @@ class T3TurboMLX(nn.Module):
         # First token: upstream's input_ids is SOS; it never stops the row.
         sos = mx.full((B,), self.hp.start_speech_token, dtype=mx.int32)
         tok, _, _, rng = sample_tokens(
-            logits, onehot_mask(sos, V), mx.zeros((B,), mx.bool_), rng, *params,
-            stop_id=stop, **flags,
+            logits,
+            onehot_mask(sos, V),
+            mx.zeros((B,), mx.bool_),
+            rng,
+            *params,
+            stop_id=stop,
+            **flags,
         )
         presence = onehot_mask(tok, V)
         finished = mx.array([i >= n_real for i in range(B)])
@@ -526,11 +584,21 @@ class T3TurboMLX(nn.Module):
             prev_arr = mx.array([col - 1 if k else col], mx.int32)
             buf_k, buf_v = cache.take(k % 2)
             try:
-                (tok, presence, finished, rng, done, prev_k, prev_v,
-                 buf_k, buf_v) = fn(
-                    tok, col_arr, prev_arr, pad_arr, mx.array([k], mx.int32), caps_arr,
-                    presence, finished, rng,
-                    *params, prev_k, prev_v, buf_k, buf_v,
+                (tok, presence, finished, rng, done, prev_k, prev_v, buf_k, buf_v) = fn(
+                    tok,
+                    col_arr,
+                    prev_arr,
+                    pad_arr,
+                    mx.array([k], mx.int32),
+                    caps_arr,
+                    presence,
+                    finished,
+                    rng,
+                    *params,
+                    prev_k,
+                    prev_v,
+                    buf_k,
+                    buf_v,
                 )
             finally:
                 cache.buffers[k % 2] = (buf_k, buf_v)
@@ -538,8 +606,9 @@ class T3TurboMLX(nn.Module):
             steps.append(tok)
             done_flags.append(done)
             n_steps += 1
-            mx.async_eval(tok, presence, finished, rng, done, prev_k, prev_v,
-                          cache.buffers[k % 2])
+            mx.async_eval(
+                tok, presence, finished, rng, done, prev_k, prev_v, cache.buffers[k % 2]
+            )
 
         out = np.array(mx.stack(steps, axis=1)).astype(np.int64)  # (B, 1 + n_steps)
         if stats is not None:
