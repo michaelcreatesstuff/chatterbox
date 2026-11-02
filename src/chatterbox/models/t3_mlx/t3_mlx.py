@@ -8,12 +8,13 @@ Converted from PyTorch version in t3.py
 
 import logging
 import os
-from typing import Optional, Dict, List
+from typing import Optional, Dict, Iterator, List, Union
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from tqdm import tqdm
 
-from .modules.llama_mlx import LlamaModelMLX, LlamaConfigMLX
+from .modules.llama_mlx import LlamaModelMLX, LlamaConfigMLX, LlamaKVCache
 from .modules.learned_pos_emb_mlx import LearnedPositionEmbeddingsMLX
 from .modules.cond_enc_mlx import T3CondEncMLX, T3CondMLX
 from .inference.t3_mlx_backend import T3MLXBackend
@@ -34,6 +35,21 @@ def _log_t3_memory(label: str):
         parts.append(f"MPS={info['mps_allocated_mb']:.0f}MB")
     mx.eval(mx.array([0]))  # Force MLX sync
     print(" | ".join(parts))
+
+
+DTYPES = {
+    "float16": mx.float16,
+    "bfloat16": mx.bfloat16,
+    "float32": mx.float32,
+}
+
+
+def resolve_dtype(dtype: Union[str, mx.Dtype]) -> mx.Dtype:
+    if isinstance(dtype, str):
+        if dtype not in DTYPES:
+            raise ValueError(f"dtype must be one of {list(DTYPES)}, got {dtype!r}")
+        return DTYPES[dtype]
+    return dtype
 
 
 def _ensure_BOT_EOT(text_tokens: mx.array, hp: T3Config):
@@ -98,8 +114,11 @@ class T3MLX(nn.Module):
             self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=False
         )
 
-        # Backend for generation
+        # Backend for generation (legacy loop only)
         self.patched_model = None
+        # Steps and forced-EOS reason of the last fast-loop generation
+        # (underscore name keeps it out of parameters()).
+        self._last_generate_stats: Optional[Dict] = None
 
     def prepare_conditioning(self, t3_cond: T3CondMLX) -> mx.array:
         """
@@ -324,6 +343,48 @@ class T3MLX(nn.Module):
 
         return loss_text, loss_speech
 
+    def finalize(
+        self,
+        dtype: Union[str, mx.Dtype] = "float32",
+        quantize_bits: Optional[int] = None,
+        group_size: int = 64,
+    ) -> "T3MLX":
+        """Cast to ``dtype`` and optionally quantize; call once after loading weights.
+
+        The default (``float32``) keeps the 1.2.0 weights unchanged. ``float16``
+        roughly halves the T3 time per token on the fast loop. Quantization
+        (weight-only, ``bits`` 4 or 8) covers the Llama linears and the speech
+        head; embeddings and the conditioning encoder stay in ``dtype``.
+        """
+        self.set_dtype(resolve_dtype(dtype))
+        if quantize_bits is not None:
+            if quantize_bits not in (4, 8):
+                raise ValueError("quantize_bits must be None, 4 or 8")
+            nn.quantize(
+                self.tfmr,
+                group_size=group_size,
+                bits=quantize_bits,
+                class_predicate=lambda _, m: isinstance(m, nn.Linear),
+            )
+            self.speech_head = nn.QuantizedLinear.from_linear(
+                self.speech_head, group_size=group_size, bits=quantize_bits
+            )
+        self.eval()
+        mx.eval(self.parameters())
+        # The legacy backend holds references to the old modules.
+        self.patched_model = None
+        return self
+
+    @property
+    def last_generate_stats(self) -> Optional[Dict]:
+        """``{"steps", "forced"}`` of the last fast-loop generation (None before one)."""
+        return self._last_generate_stats
+
+    @property
+    def compute_dtype(self) -> mx.Dtype:
+        """Activation dtype of the decode loop (the embedding dtype)."""
+        return self.speech_emb.weight.dtype
+
     def generate(
         self,
         *,
@@ -338,6 +399,7 @@ class T3MLX(nn.Module):
         show_progress: bool = True,
         use_alignment_analyzer: bool = True,  # Enable by default for quality control
         seed: Optional[int] = None,
+        fast: bool = True,
     ) -> mx.array:
         """
         Generate speech tokens autoregressively.
@@ -352,12 +414,205 @@ class T3MLX(nn.Module):
             repetition_penalty: Penalty for repeated tokens
             cfg_weight: Classifier-free guidance weight
             use_alignment_analyzer: Whether to use alignment analyzer for quality control
-            seed: Random seed for deterministic generation. If None (default),
-                  uses non-deterministic generation. Set to an integer (e.g., 42)
-                  for reproducible results.
+            seed: Ignored here; the caller seeds MLX (see mtl_tts_mlx._generate_single).
+            fast: Use the fast decode loop (default). ``False`` runs the 1.2.0 loop.
 
         Returns:
-            Generated speech token IDs
+            Generated speech token IDs (1, N); the EOS token is the last one when sampled.
+        """
+        kwargs = dict(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            cfg_weight=cfg_weight,
+            show_progress=show_progress,
+            use_alignment_analyzer=use_alignment_analyzer,
+        )
+        if not fast:
+            # 1.2.0 behaviour (no buffer cache during the loop), but restore the
+            # caller's limit: a global 0 also slowed every other MLX engine.
+            old_limit = mx.set_cache_limit(0)
+            try:
+                return self._generate_legacy(**kwargs, seed=seed)
+            finally:
+                mx.set_cache_limit(old_limit)
+
+        ids = list(self.generate_tokens(**kwargs))
+        if not ids:
+            return mx.array([[]], dtype=mx.int32)
+        return mx.array([ids], dtype=mx.int32)
+
+    def generate_tokens(
+        self,
+        *,
+        t3_cond: T3CondMLX,
+        text_tokens: mx.array,
+        max_new_tokens: Optional[int] = None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        min_p: float = 0.05,
+        repetition_penalty: float = 1.2,
+        cfg_weight: float = 0.5,
+        show_progress: bool = False,
+        use_alignment_analyzer: bool = True,
+    ) -> Iterator[int]:
+        """
+        Fast decode loop; yields speech token IDs as they are sampled.
+
+        Same sampling as the 1.2.0 loop (CFG combine, alignment analyzer,
+        repetition penalty, temperature, min_p, top_p, categorical), with:
+
+        - a preallocated KV cache (no per-step concatenation);
+        - fused SDPA in every layer; explicit attention weights only for the
+          LLAMA_ALIGNED_HEADS, batch row 0, and only the rows the analyzer reads;
+        - the speech head on the last position only;
+        - the analyzer on the host (AlignmentStreamAnalyzerNP, same rules);
+        - no change to the MLX cache limit and no periodic ``mx.clear_cache``.
+
+        The EOS token is yielded as the last item when it is sampled. After the
+        loop, ``self.last_generate_stats`` holds ``steps`` and ``forced`` (the
+        analyzer's forced-EOS reason, or None).
+        """
+        from .inference.alignment_stream_analyzer_mlx import (
+            AlignmentStreamAnalyzerNP,
+            LLAMA_ALIGNED_HEADS,
+        )
+        from .inference.sampling_utils_mlx import (
+            apply_repetition_penalty,
+            apply_top_p,
+            apply_min_p,
+        )
+
+        if text_tokens.ndim == 1:
+            text_tokens = mx.expand_dims(text_tokens, 0)
+        _ensure_BOT_EOT(text_tokens, self.hp)
+        if max_new_tokens is None:
+            max_new_tokens = self.hp.max_speech_tokens
+
+        dtype = self.compute_dtype
+        eos = self.hp.stop_speech_token
+
+        # Prefill input: [cond | text | BOS] + BOS, as in the 1.2.0 loop
+        bos_token = mx.array([[self.hp.start_speech_token]])
+        bos_embed = self.speech_emb(bos_token) + self.speech_pos_emb.get_fixed_embedding(0)
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=bos_token,
+            cfg_weight=cfg_weight,
+        )
+        if cfg_weight > 0.0 and embeds.shape[0] == 2:
+            bos_embed = mx.concatenate([bos_embed, bos_embed], axis=0)
+        inputs_embeds = mx.concatenate([embeds, bos_embed], axis=1).astype(dtype)
+        batch = inputs_embeds.shape[0]
+
+        len_text = text_tokens.shape[1]
+        text_end = len_cond + len_text
+        analyzer = None
+        aligned_heads: Dict[int, List[int]] = {}
+        if use_alignment_analyzer:
+            analyzer = AlignmentStreamAnalyzerNP((len_cond, text_end))
+            for layer_idx, head_idx in LLAMA_ALIGNED_HEADS:
+                aligned_heads.setdefault(layer_idx, []).append(head_idx)
+
+        cache = LlamaKVCache(len(self.tfmr.layers))
+
+        def forward(x: mx.array, rows_from: int):
+            h, weights = self.tfmr.forward_fast(
+                x, cache, aligned_heads=aligned_heads, rows_from=rows_from
+            )
+            logits = self.speech_head(h)[:, -1, :]
+            rows = mx.stack(weights).mean(axis=0) if weights else None
+            return logits, rows
+
+        # The analyzer's first chunk is the prefill rows from the end of the text
+        logits_step, rows = forward(inputs_embeds, rows_from=text_end)
+
+        vocab = logits_step.shape[-1]
+        eos_mask = (mx.arange(vocab) == eos)[None, :]
+        forced_logits = mx.where(eos_mask, 32768.0, mx.full((1, vocab), -32768.0))
+
+        generated_token_ids: List[int] = []
+        steps = range(max_new_tokens)
+        if show_progress:
+            steps = tqdm(steps, desc="Generating", dynamic_ncols=True)
+        try:
+            for i in steps:
+                # CFG: combine conditional and unconditional predictions (in fp32)
+                logits_step = logits_step.astype(mx.float32)
+                if cfg_weight > 0.0:
+                    cond = logits_step[0:1, :]
+                    uncond = logits_step[1:2, :]
+                    logits = cond + cfg_weight * (cond - uncond)
+                else:
+                    logits = logits_step[0:1, :]
+
+                # Analyzer before the other logit processors (as in the 1.2.0 loop)
+                if analyzer is not None:
+                    last_token = generated_token_ids[-1] if generated_token_ids else None
+                    suppress, force = analyzer.step(
+                        np.array(rows.astype(mx.float32)), next_token=last_token
+                    )
+                    if force:
+                        logits = forced_logits
+                    elif suppress:
+                        logits = mx.where(eos_mask, -32768.0, logits)
+
+                logits = apply_repetition_penalty(
+                    logits, generated_token_ids, repetition_penalty
+                )
+                if temperature != 1.0:
+                    logits = logits / temperature
+                logits = apply_min_p(logits, min_p)
+                logits = apply_top_p(logits, top_p)
+
+                probs = mx.softmax(logits, axis=-1)
+                next_token = mx.random.categorical(mx.log(probs + 1e-10))
+                next_token = mx.reshape(next_token, (1, 1))
+                token_val = int(next_token[0, 0])
+                generated_token_ids.append(token_val)
+                yield token_val
+
+                if token_val == eos:
+                    logger.info(f"✅ EOS token detected at step {i+1}")
+                    break
+
+                next_embed = self.speech_emb(next_token)
+                next_embed = next_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+                if batch == 2:
+                    next_embed = mx.concatenate([next_embed, next_embed], axis=0)
+                logits_step, rows = forward(next_embed.astype(dtype), rows_from=0)
+        finally:
+            self._last_generate_stats = {
+                "steps": len(generated_token_ids),
+                "forced": analyzer.forced if analyzer is not None else None,
+            }
+
+    def _generate_legacy(
+        self,
+        *,
+        t3_cond: T3CondMLX,
+        text_tokens: mx.array,
+        max_new_tokens: Optional[int] = None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        min_p: float = 0.05,
+        repetition_penalty: float = 1.2,
+        cfg_weight: float = 0.5,
+        show_progress: bool = True,
+        use_alignment_analyzer: bool = True,
+        seed: Optional[int] = None,
+    ) -> mx.array:
+        """
+        Reference decode loop (chatterbox-mlx <= 1.2.0), kept for ``fast=False``.
+
+        Manual attention with weights in every layer, a KV cache grown by
+        concatenation, and the MLX analyzer. ``generate`` sets the cache limit
+        to 0 around this call and restores it afterwards.
         """
         # Import AlignmentStreamAnalyzerMLX
         from .inference.alignment_stream_analyzer_mlx import (
@@ -374,11 +629,6 @@ class T3MLX(nn.Module):
         # Initialize generation
         if max_new_tokens is None:
             max_new_tokens = self.hp.max_speech_tokens
-
-        # Set memory limits to prevent excessive memory usage
-        # Cache limit of 0 forces immediate reclamation (more aggressive)
-        # This helps prevent memory spikes during long generations
-        mx.set_cache_limit(0)
 
         _log_t3_memory("generate_start")
 
@@ -613,6 +863,7 @@ class T3MLX(nn.Module):
         stop_on_eos: bool = True,
         do_sample: bool = True,
         length_penalty: float = 1.0,
+        fast: bool = True,
     ) -> mx.array:
         """
         Inference wrapper for compatibility with PyTorch T3 API.
@@ -639,6 +890,7 @@ class T3MLX(nn.Module):
             stop_on_eos: Ignored (for PyTorch API compatibility)
             do_sample: Ignored (for PyTorch API compatibility)
             length_penalty: Ignored (for PyTorch API compatibility)
+            fast: Use the fast decode loop (default); False runs the 1.2.0 loop
 
         Returns:
             Generated speech token IDs
@@ -655,4 +907,5 @@ class T3MLX(nn.Module):
             show_progress=show_progress,
             use_alignment_analyzer=use_alignment_analyzer,
             seed=seed,
+            fast=fast,
         )

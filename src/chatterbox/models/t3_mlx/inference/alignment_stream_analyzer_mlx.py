@@ -14,8 +14,9 @@ Monitors attention patterns to detect and prevent:
 
 import logging
 import mlx.core as mx
+import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -338,3 +339,128 @@ class AlignmentStreamAnalyzerMLX:
             complete=self.complete,
             position=self.text_position,
         )
+
+
+class AlignmentStreamAnalyzerNP:
+    """
+    Host-side (numpy) twin of :class:`AlignmentStreamAnalyzerMLX` for the fast decode loop.
+
+    Same rules, same thresholds, same order as ``AlignmentStreamAnalyzerMLX.step``.
+    The differences are only in the interface:
+
+    - the caller passes the mean aligned-head attention rows directly (one small host
+      copy per step) instead of full per-layer attention maps;
+    - ``step`` returns ``(suppress_eos, force_eos)``; the caller edits the logits;
+    - the reason for a forced EOS is kept in ``forced`` (None if EOS was never forced).
+    """
+
+    def __init__(self, text_tokens_slice: Tuple[int, int]):
+        """
+        Args:
+            text_tokens_slice: (start, end) of the text tokens in the prefill sequence,
+                as for AlignmentStreamAnalyzerMLX.
+        """
+        self.text_tokens_slice = (i, j) = text_tokens_slice
+        self.alignment = np.zeros((0, j - i), dtype=np.float32)
+        self.curr_frame_pos = 0
+        self.text_position = 0
+        self.started = False
+        self.started_at: Optional[int] = None
+        self.complete = False
+        self.completed_at: Optional[int] = None
+        self.collapsed_frames = 0
+        self.generated_tokens: List[int] = []
+        self.forced: Optional[Dict] = None
+
+    def step(
+        self, rows: np.ndarray, next_token: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """
+        Analyze one generation step.
+
+        Args:
+            rows: Mean aligned attention (n, L_k). At the first step, the prefill query
+                rows from the end of the text (``rows_from = j``); later, the newest row.
+            next_token: Last generated token ID (for repetition tracking)
+
+        Returns:
+            (suppress_eos, force_eos). force_eos wins when both are set.
+        """
+        i, j = self.text_tokens_slice
+        if self.curr_frame_pos == 0:
+            A_chunk = rows[:, i:j]
+        else:
+            A_chunk = rows[-1:, i:j]
+
+        self.alignment = np.concatenate([self.alignment, A_chunk], axis=0)
+        A = self.alignment
+        T, S = A.shape
+
+        # Text position: argmax of the newest frame, ignored on a discontinuity
+        cur_text_posn = int(np.argmax(A_chunk[-1]))
+        if -4 < cur_text_posn - self.text_position < 7:
+            self.text_position = cur_text_posn
+
+        # False start
+        if T >= 2:
+            false_start = (not self.started) and (
+                float(A[-2:, -2:].max()) > 0.1 or float(A[:, :4].max()) < 0.5
+            )
+        else:
+            false_start = not self.started
+        self.started = not false_start
+        if self.started and self.started_at is None:
+            self.started_at = T
+
+        # Completion
+        self.complete = self.complete or self.text_position >= S - 3
+        if self.complete and self.completed_at is None:
+            self.completed_at = T
+
+        # Long tail and alignment repetition (only after completion)
+        long_tail = False
+        alignment_repetition = False
+        if self.complete and T > self.completed_at:
+            long_tail = float(A[self.completed_at :, -3:].sum(axis=0).max()) >= 5
+            past_attention = A[self.completed_at :, :-5]
+            if past_attention.shape[1] > 0:
+                alignment_repetition = float(past_attention.max(axis=1).sum()) > 5
+
+        # Text-attention collapse
+        attention_collapse = False
+        if self.complete:
+            if float(A_chunk[-1].max()) < TEXT_ATTENTION_COLLAPSE_THRESHOLD:
+                self.collapsed_frames += 1
+            else:
+                self.collapsed_frames = 0
+            attention_collapse = self.collapsed_frames >= TEXT_ATTENTION_COLLAPSE_FRAMES
+
+        # Token repetition: >= 2 of the last 4 after completion, >= 4 of the last 8 before
+        if next_token is not None:
+            self.generated_tokens.append(next_token)
+            if len(self.generated_tokens) > 8:
+                self.generated_tokens = self.generated_tokens[-8:]
+        g = self.generated_tokens
+        token_repetition = False
+        if self.complete:
+            if len(g) >= 4:
+                token_repetition = max(g[-4:].count(t) for t in g[-4:]) >= 2
+        elif len(g) >= 6:
+            token_repetition = max(g[-8:].count(t) for t in g[-8:]) >= 4
+
+        suppress_eos = cur_text_posn < S - 3 and S > 5
+        force_eos = (
+            long_tail or alignment_repetition or token_repetition or attention_collapse
+        )
+        if force_eos and self.forced is None:
+            self.forced = dict(
+                long_tail=long_tail,
+                alignment_repetition=alignment_repetition,
+                token_repetition=token_repetition,
+                attention_collapse=attention_collapse,
+                step=self.curr_frame_pos,
+            )
+            logger.debug(f"Forcing EOS token: {self.forced}")
+
+        self.curr_frame_pos += 1
+        return suppress_eos, force_eos

@@ -7,9 +7,12 @@ This is a simplified version focused on what T3 needs.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 import mlx.core as mx
 import mlx.nn as nn
+
+# The fast-path KV cache grows in chunks of this many positions.
+KV_CACHE_STEP = 256
 
 
 @dataclass
@@ -181,6 +184,52 @@ class RoPE(nn.Module):
             )
 
 
+class LlamaKVCache:
+    """
+    Preallocated per-layer KV cache for the fast decode path.
+
+    Buffers are ``(B, n_kv_heads, capacity, head_dim)`` and grow in chunks of
+    ``KV_CACHE_STEP`` positions; each step writes its keys/values in place
+    (slice assignment) instead of concatenating the whole cache.
+    """
+
+    def __init__(self, num_layers: int, step: int = KV_CACHE_STEP):
+        self.step = step
+        self.keys: List[Optional[mx.array]] = [None] * num_layers
+        self.values: List[Optional[mx.array]] = [None] * num_layers
+        self.offset = 0  # positions written (same for every layer)
+        self._written = [0] * num_layers
+
+    def update_and_fetch(
+        self, layer_idx: int, k: mx.array, v: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        """Write ``k``/``v`` ``(B, H, L, D)`` at the current offset; return the filled prefix."""
+        prev = self._written[layer_idx]
+        L = k.shape[2]
+        keys = self.keys[layer_idx]
+        if keys is None or prev + L > keys.shape[2]:
+            B, H, _, D = k.shape
+            n_new = ((L + self.step - 1) // self.step) * self.step
+            new_k = mx.zeros((B, H, n_new, D), dtype=k.dtype)
+            new_v = mx.zeros((B, H, n_new, D), dtype=v.dtype)
+            if keys is None:
+                self.keys[layer_idx], self.values[layer_idx] = new_k, new_v
+            else:
+                self.keys[layer_idx] = mx.concatenate(
+                    [keys[..., :prev, :], new_k], axis=2
+                )
+                self.values[layer_idx] = mx.concatenate(
+                    [self.values[layer_idx][..., :prev, :], new_v], axis=2
+                )
+        end = prev + L
+        self.keys[layer_idx][..., prev:end, :] = k
+        self.values[layer_idx][..., prev:end, :] = v
+        self._written[layer_idx] = end
+        if layer_idx == len(self.keys) - 1:
+            self.offset = end
+        return self.keys[layer_idx][..., :end, :], self.values[layer_idx][..., :end, :]
+
+
 class Attention(nn.Module):
     """Multi-head attention with optional GQA support."""
 
@@ -309,6 +358,66 @@ class Attention(nn.Module):
         # Return output, updated cache, and optional attention weights
         # (k, v are in transposed format: B, n_heads, L, head_dim)
         return output, (k, v), attention_weights
+
+
+    def fast_call(
+        self,
+        x: mx.array,
+        cache: LlamaKVCache,
+        layer_idx: int,
+        aligned_heads: Optional[List[int]] = None,
+        rows_from: int = 0,
+    ) -> Tuple[mx.array, List[mx.array]]:
+        """
+        Fast-path attention: fused SDPA, preallocated cache, weights for selected heads only.
+
+        Args:
+            x: Input tensor of shape (B, L, D)
+            cache: Shared LlamaKVCache (written at ``cache.offset``)
+            layer_idx: Index of this layer in the cache
+            aligned_heads: Heads whose attention weights are returned (batch row 0)
+            rows_from: First query row (within this call) to return weights for
+
+        Returns:
+            (output, weights) where weights holds one fp32 (L - rows_from, L_k) array
+            per entry of ``aligned_heads``.
+        """
+        B, L, _ = x.shape
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        offset = cache.offset
+        q, k = self.rope(q, k, offset=offset)
+        k, v = cache.update_and_fetch(layer_idx, k, v)
+
+        output = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask="causal" if L > 1 else None
+        )
+
+        # Explicit weights only for the heads the alignment analyzer reads,
+        # only for the conditional batch row and only for the rows it needs.
+        weights = []
+        if aligned_heads:
+            L_k = k.shape[2]
+            n_rep = self.num_heads // self.num_kv_heads
+            for head in aligned_heads:
+                qh = q[0, head, rows_from:, :].astype(mx.float32)  # (n, Dh)
+                kh = k[0, head // n_rep, :, :].astype(mx.float32)  # (L_k, Dh)
+                scores = (qh @ kh.T) * self.scale
+                if L > 1:
+                    # Causal mask for the prefill rows (same as the manual path)
+                    n = qh.shape[0]
+                    q_pos = mx.arange(offset + rows_from, offset + rows_from + n)
+                    visible = mx.arange(L_k)[None, :] <= q_pos[:, None]
+                    scores = mx.where(visible, scores, -1e9)
+                weights.append(mx.softmax(scores, axis=-1))
+
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output), weights
 
 
 class MLP(nn.Module):
@@ -451,3 +560,38 @@ class LlamaModelMLX(nn.Module):
             result["attentions"] = all_attentions
 
         return result
+
+    def forward_fast(
+        self,
+        inputs_embeds: mx.array,
+        cache: LlamaKVCache,
+        aligned_heads: Optional[Dict[int, List[int]]] = None,
+        rows_from: int = 0,
+    ) -> Tuple[mx.array, List[mx.array]]:
+        """
+        Fast decode forward (used by T3MLX's fast generation loop).
+
+        Args:
+            inputs_embeds: Input embeddings of shape (B, L, D)
+            cache: LlamaKVCache, updated in place
+            aligned_heads: {layer_idx: [head_idx, ...]} whose weights to return
+            rows_from: First query row to return weights for (see Attention.fast_call)
+
+        Returns:
+            (normed hidden state of the last position (B, 1, D), list of weight rows)
+        """
+        aligned_heads = aligned_heads or {}
+        h = inputs_embeds
+        weights: List[mx.array] = []
+        for i, layer in enumerate(self.layers):
+            r, w = layer.self_attn.fast_call(
+                layer.input_layernorm(h),
+                cache,
+                i,
+                aligned_heads=aligned_heads.get(i),
+                rows_from=rows_from,
+            )
+            weights.extend(w)
+            h = h + r
+            h = h + layer.mlp(layer.post_attention_layernorm(h))
+        return self.norm(h[:, -1:, :]), weights
