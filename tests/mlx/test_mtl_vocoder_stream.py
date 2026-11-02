@@ -234,6 +234,18 @@ class TestDefaults(_Base):
             ["ckpt_dir", "t3_config", "use_default_speaker", "device", "vocoder"],
         )
 
+    def test_stream_window_defaults(self):
+        import chatterbox.tts_turbo_mlx as T
+
+        p = inspect.signature(M.ChatterboxMultilingualTTSMLX.generate_stream).parameters
+        self.assertEqual(p["first_chunk_tokens"].default, 25)
+        self.assertEqual(p["chunk_tokens"].default, 40)
+        self.assertEqual(p["context_tokens"].default, 50)
+        self.assertEqual(p["lookahead_tokens"].default, 5)
+        # Turbo keeps its own default.
+        tp = inspect.signature(T.ChatterboxTurboMLX.generate_stream).parameters
+        self.assertEqual(tp["chunk_tokens"].default, 50)
+
     def test_default_instance_uses_pytorch_s3gen(self):
         tts = M.ChatterboxMultilingualTTSMLX(
             t3=_T3Stub(),

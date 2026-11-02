@@ -95,7 +95,6 @@ from .streaming_mlx import (
     S3GEN_PRE_LOOKAHEAD,
     S3GEN_SIL,
     STREAM_BLOCK_TOKENS,
-    STREAM_CHUNK_TOKENS,
     STREAM_CONTEXT_TOKENS,
     STREAM_FIRST_CHUNK_TOKENS,
     STREAM_LOOKAHEAD_TOKENS,
@@ -119,6 +118,14 @@ DEFAULT_CFM_STEPS = {"pt": None, "mlx": 5, "meanflow": 2}
 # The meanflow vocoder ships with Chatterbox-Turbo, not with this model.
 MEANFLOW_REPO_ID = "ResembleAI/chatterbox-turbo"
 MEANFLOW_FILENAME = "s3gen_meanflow.safetensors"
+
+# --- Streaming (generate_stream) ---------------------------------------- #
+# Second token window. Turbo uses 50 (STREAM_CHUNK_TOKENS). Measured on the
+# multilingual model (fp16 T3 + meanflow, M4, 24 replies x 3 runs): with 50
+# the second window of the first sentence left only ~0.09 s of playback
+# slack and gapped in 2-8 of 24 replies (0.01-0.37 s); with 40, 0 gaps in
+# 2 runs, same first-audio time (0.60 s) and quality.
+MTL_STREAM_CHUNK_TOKENS = 40
 
 # --- T3 precision ---------------------------------------------------------- #
 T3_DTYPES = {
@@ -1139,7 +1146,7 @@ class ChatterboxMultilingualTTSMLX:
         n_cfm_timesteps: Optional[int] = None,
         overlap_duration: float = 0.01,
         first_chunk_tokens: int = STREAM_FIRST_CHUNK_TOKENS,
-        chunk_tokens: int = STREAM_CHUNK_TOKENS,
+        chunk_tokens: int = MTL_STREAM_CHUNK_TOKENS,
         context_tokens: int = STREAM_CONTEXT_TOKENS,
         lookahead_tokens: int = STREAM_LOOKAHEAD_TOKENS,
     ) -> Iterator[np.ndarray]:
@@ -1155,8 +1162,9 @@ class ChatterboxMultilingualTTSMLX:
           every chunk is vocoded on growing token windows while T3 still
           decodes it, as Turbo's ``generate_stream``: the first window after
           ``first_chunk_tokens`` tokens (plus ``lookahead_tokens``), the next
-          after ``chunk_tokens`` more, then windows double up to 200 tokens.
-          Each window re-vocodes ``context_tokens`` tokens on its left (see
+          after ``chunk_tokens`` more (default 40; Turbo uses 50), then
+          windows double up to 200 tokens. Each window re-vocodes
+          ``context_tokens`` tokens on its left (see
           :class:`~chatterbox.streaming_mlx._WindowVocoder`). A chunk ends
           with 3 silence tokens and a final-mode S3Gen call (as Turbo).
           A chunk that ends before its first window is vocoded once.
