@@ -7,17 +7,33 @@ Provides significant performance improvements on Apple Silicon (M1/M2/M3/M4).
 
 This implementation uses a hybrid approach:
 - MLX for T3 (autoregressive text-to-speech token generation) - main performance win
-- PyTorch for S3Gen (vocoder) - uses MPS acceleration on Apple Silicon
+- S3Gen (vocoder), selected with ``vocoder=`` at load time:
+
+  - ``"pt"`` (default, as in 1.2.0): the multilingual S3Gen in PyTorch on MPS,
+    5 midpoint CFM steps.
+  - ``"mlx"``: the same S3Gen weights on MLX (``S3Token2WavMLX``), 5 steps.
+  - ``"meanflow"``: the meanflow-distilled S3Gen of Chatterbox-Turbo on MLX,
+    2 steps. It needs ``s3gen_meanflow.safetensors`` from the
+    ``ResembleAI/chatterbox-turbo`` snapshot (``meanflow_path=``).
+
+  Voice conditioning (``prepare_conditionals``) always uses the PyTorch S3Gen's
+  encoders.
+
+:meth:`ChatterboxMultilingualTTSMLX.generate_stream` yields audio pieces while
+T3 still decodes (token windows, as Turbo's ``generate_stream``).
 
 Supports 23 languages including English, Spanish, French, German, Japanese, Chinese, etc.
 """
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, List, Dict
+from typing import TYPE_CHECKING, Iterator, Optional, List, Dict, Union
+import functools
 import logging
 import re
 import os
+import threading
+import time
 
 import numpy as np
 
@@ -75,12 +91,144 @@ from .generation_utils import (
     print_crossfading,
 )
 
+from .streaming_mlx import (
+    S3GEN_PRE_LOOKAHEAD,
+    S3GEN_SIL,
+    STREAM_BLOCK_TOKENS,
+    STREAM_CONTEXT_TOKENS,
+    STREAM_FIRST_CHUNK_TOKENS,
+    STREAM_LOOKAHEAD_TOKENS,
+    MLXVocoderHost,
+    _ChunkJoiner,
+    _WindowVocoder,
+    ref_dict_to_mlx,
+)
+
 import perth
 import librosa
 
 logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox"
+
+# --- Vocoder choice ------------------------------------------------------- #
+VOCODERS = ("pt", "mlx", "meanflow")
+# CFM steps when ``n_cfm_timesteps`` is None ("pt": the PyTorch flow default, 5).
+DEFAULT_CFM_STEPS = {"pt": None, "mlx": 5, "meanflow": 2}
+# The meanflow vocoder ships with Chatterbox-Turbo, not with this model.
+MEANFLOW_REPO_ID = "ResembleAI/chatterbox-turbo"
+MEANFLOW_FILENAME = "s3gen_meanflow.safetensors"
+
+# --- Streaming (generate_stream) ---------------------------------------- #
+# Second token window. Turbo uses 50 (STREAM_CHUNK_TOKENS). Measured on the
+# multilingual model (fp16 T3 + meanflow, M4, 24 replies x 3 runs): with 50
+# the second window of the first sentence left only ~0.09 s of playback
+# slack and gapped in 2-8 of 24 replies (0.01-0.37 s); with 40, 0 gaps in
+# 2 runs, same first-audio time (0.60 s) and quality.
+MTL_STREAM_CHUNK_TOKENS = 40
+
+# --- T3 precision ---------------------------------------------------------- #
+T3_DTYPES = {
+    "fp32": "float32",
+    "float32": "float32",
+    "fp16": "float16",
+    "float16": "float16",
+}
+T3_QUANT_GROUP_SIZE = 64
+
+
+def _check_vocoder(vocoder: str) -> str:
+    if vocoder not in VOCODERS:
+        raise ValueError(f"vocoder must be one of {VOCODERS}, got {vocoder!r}")
+    return vocoder
+
+
+def resolve_meanflow_path(
+    meanflow_path: Optional[Union[str, Path]], ckpt_dir: Optional[Path] = None
+) -> Path:
+    """Locate ``s3gen_meanflow.safetensors`` for ``vocoder="meanflow"``.
+
+    ``meanflow_path`` is the file itself or a directory that holds it (for
+    example the local ``ResembleAI/chatterbox-turbo`` snapshot). With
+    ``None``, ``ckpt_dir`` is searched. Nothing is downloaded here; get the
+    file with ``huggingface_hub.hf_hub_download("ResembleAI/chatterbox-turbo",
+    "s3gen_meanflow.safetensors")`` or use :meth:`from_pretrained`.
+    """
+    candidates = []
+    if meanflow_path is not None:
+        p = Path(meanflow_path)
+        candidates.append(p / MEANFLOW_FILENAME if p.is_dir() else p)
+    elif ckpt_dir is not None:
+        candidates.append(Path(ckpt_dir) / MEANFLOW_FILENAME)
+    for p in candidates:
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        f"vocoder='meanflow' needs {MEANFLOW_FILENAME} from {MEANFLOW_REPO_ID} "
+        f"(looked in: {', '.join(str(c) for c in candidates) or 'nowhere'}). "
+        "Pass meanflow_path=<file or Turbo snapshot dir>, e.g. "
+        f"huggingface_hub.hf_hub_download({MEANFLOW_REPO_ID!r}, {MEANFLOW_FILENAME!r})."
+    )
+
+
+def load_mlx_vocoder(weights_path: Union[str, Path], meanflow: bool):
+    """An MLX ``S3Token2WavMLX`` with the weights of a PyTorch S3Gen checkpoint."""
+    from .models.s3gen_mlx.convert_weights import convert_and_load_weights
+    from .models.s3gen_mlx.s3gen_mlx import S3Token2WavMLX
+
+    voc = S3Token2WavMLX(meanflow=meanflow)
+    weights = convert_and_load_weights(str(weights_path))
+    voc.load_weights([(k, mx.array(v)) for k, v in weights.items()], strict=False)
+    voc.eval()
+    mx.eval(voc.parameters())
+    # Weight conversion leaves GBs in MLX's buffer cache.
+    mx.clear_cache()
+    return voc
+
+
+def apply_t3_precision(
+    t3: T3MLX, t3_dtype: str = "float32", quantize_bits: Optional[int] = None
+) -> T3MLX:
+    """Cast T3 to ``t3_dtype`` and optionally quantize it (4 or 8 bits, group 64).
+
+    ``"float32"`` without quantization leaves T3 untouched (the 1.2.0
+    weights). Otherwise ``T3MLX.finalize(dtype=..., quantize_bits=...)`` does
+    the work; a T3 without ``finalize`` is cast with ``set_dtype`` and its
+    transformer quantized with ``mlx.nn.quantize``.
+    """
+    if t3_dtype not in T3_DTYPES:
+        raise ValueError(f"t3_dtype must be one of {list(T3_DTYPES)}, got {t3_dtype!r}")
+    if quantize_bits not in (None, 4, 8):
+        raise ValueError("quantize_bits must be None, 4 or 8")
+    dtype = T3_DTYPES[t3_dtype]
+    if dtype == "float32" and quantize_bits is None:
+        return t3
+    finalize = getattr(t3, "finalize", None)
+    if callable(finalize):
+        finalize(dtype=dtype, quantize_bits=quantize_bits)
+    else:
+        import mlx.nn as nn
+
+        if dtype != "float32":
+            t3.set_dtype(getattr(mx, dtype))
+        if quantize_bits is not None:
+            nn.quantize(t3.tfmr, group_size=T3_QUANT_GROUP_SIZE, bits=quantize_bits)
+        t3.eval()
+    mx.eval(t3.parameters())
+    return t3
+
+
+def _exclusive(method):
+    """Run ``method`` under the instance lock; refuse while a stream is open."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            self._check_no_stream()
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
 
 # Supported languages for the multilingual model
 SUPPORTED_LANGUAGES = {
@@ -341,17 +489,31 @@ class ChatterboxMultilingualTTSMLX:
         tokenizer: MTLTokenizer,
         device: str = "mps",
         conds: Conditionals = None,
+        *,
+        vocoder: str = "pt",
+        s3gen_mlx=None,
+        mlx_cache_limit_gb: float = 2.0,
     ):
         """
         Initialize hybrid MLX/PyTorch multilingual TTS pipeline.
 
         Args:
             t3: T3MLX model (MLX)
-            s3gen: S3Gen vocoder (PyTorch)
+            s3gen: S3Gen (PyTorch). With ``vocoder="pt"`` it vocodes; it
+                always provides the conditioning encoders (``embed_ref``, S3
+                tokenizer).
             ve: Voice encoder (PyTorch)
             tokenizer: Multilingual text tokenizer
             device: PyTorch device for S3Gen ("mps" or "cpu")
             conds: Optional pre-computed conditioning
+            vocoder: ``"pt"`` (PyTorch S3Gen, default), ``"mlx"`` or
+                ``"meanflow"`` (``s3gen_mlx`` vocodes).
+            s3gen_mlx: MLX ``S3Token2WavMLX`` for ``vocoder="mlx"``
+                (``meanflow=False``, multilingual ``s3gen.pt`` weights) or
+                ``"meanflow"`` (``meanflow=True``, Turbo's
+                ``s3gen_meanflow.safetensors``).
+            mlx_cache_limit_gb: With an MLX vocoder, release MLX's buffer
+                cache after a vocode once it holds more than this.
         """
         self.sr = S3GEN_SR  # Sample rate: 24kHz
         self.t3 = t3
@@ -360,11 +522,38 @@ class ChatterboxMultilingualTTSMLX:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
+        # NOTE (watermark): the Perth watermarker is built here but, as in
+        # every release up to 1.2.0, generate(), generate_long() and
+        # generate_stream() never apply it -- the audio is NOT watermarked.
+        # This is kept on purpose (no behaviour change) until the owner
+        # decides; Turbo applies it per piece (see ChatterboxTurboMLX).
         self.watermarker = perth.PerthImplicitWatermarker()
+
+        self.vocoder = _check_vocoder(vocoder)
+        if vocoder != "pt":
+            if s3gen_mlx is None:
+                raise ValueError(f"vocoder={vocoder!r} needs s3gen_mlx")
+            if bool(getattr(s3gen_mlx, "meanflow", vocoder == "meanflow")) != (
+                vocoder == "meanflow"
+            ):
+                raise ValueError(
+                    f"vocoder={vocoder!r} does not match s3gen_mlx.meanflow="
+                    f"{getattr(s3gen_mlx, 'meanflow', None)}"
+                )
+        self.s3gen_mlx = s3gen_mlx
+        self.mlx_cache_limit = int(mlx_cache_limit_gb * 1024**3)
+        self.last_timings: dict = {}
+        # One call at a time per instance (calls share T3's state and the
+        # conditioning). generate_stream holds it while its generator is open.
+        self._lock = threading.RLock()
+        self._stream_active = 0
+        # MLX copy of conds.gen for the MLX vocoders, rebuilt when conds change.
+        self._mlx_ref_src = None
+        self._mlx_ref = None
 
         # Evaluate lazily-built MLX state now, so the model can be used from
         # threads other than the one that loaded it (MLX streams are per-thread).
-        materialize_mlx_state(self.t3, self.conds)
+        materialize_mlx_state(self.t3, self.conds, self.s3gen_mlx)
 
     @classmethod
     def get_supported_languages(cls) -> Dict[str, str]:
@@ -378,6 +567,12 @@ class ChatterboxMultilingualTTSMLX:
         t3_config: Optional[T3Config] = None,
         use_default_speaker: bool = True,
         device: str = "mps",
+        *,
+        vocoder: str = "pt",
+        meanflow_path: Optional[Union[str, Path]] = None,
+        t3_dtype: str = "float32",
+        quantize_bits: Optional[int] = None,
+        mlx_cache_limit_gb: float = 2.0,
     ) -> "ChatterboxMultilingualTTSMLX":
         """
         Load pre-trained multilingual Chatterbox TTS model with MLX optimization.
@@ -387,10 +582,15 @@ class ChatterboxMultilingualTTSMLX:
             t3_config: Optional T3 configuration (default: multilingual)
             use_default_speaker: Whether to load default speaker conditioning
             device: PyTorch device for S3Gen ("mps" or "cpu")
+            vocoder, meanflow_path, t3_dtype, quantize_bits, mlx_cache_limit_gb:
+                As :meth:`from_local`. With ``vocoder="meanflow"`` and no
+                ``meanflow_path``, this call also downloads
+                ``s3gen_meanflow.safetensors`` from ``ResembleAI/chatterbox-turbo``.
 
         Returns:
             ChatterboxMultilingualTTSMLX instance
         """
+        _check_vocoder(vocoder)
         logger.info("Loading Chatterbox Multilingual TTS with MLX optimization...")
 
         # Download model files from HuggingFace
@@ -411,7 +611,27 @@ class ChatterboxMultilingualTTSMLX:
             )
         )
 
-        return cls.from_local(ckpt_dir, t3_config, use_default_speaker, device)
+        if vocoder == "meanflow" and meanflow_path is None:
+            from huggingface_hub import hf_hub_download
+
+            meanflow_path = hf_hub_download(
+                MEANFLOW_REPO_ID,
+                MEANFLOW_FILENAME,
+                cache_dir=cache_dir,
+                token=os.getenv("HF_TOKEN") or None,
+            )
+
+        return cls.from_local(
+            ckpt_dir,
+            t3_config,
+            use_default_speaker,
+            device,
+            vocoder=vocoder,
+            meanflow_path=meanflow_path,
+            t3_dtype=t3_dtype,
+            quantize_bits=quantize_bits,
+            mlx_cache_limit_gb=mlx_cache_limit_gb,
+        )
 
     @classmethod
     def from_local(
@@ -420,20 +640,58 @@ class ChatterboxMultilingualTTSMLX:
         t3_config: Optional[T3Config] = None,
         use_default_speaker: bool = True,
         device: str = "mps",
+        *,
+        vocoder: str = "pt",
+        meanflow_path: Optional[Union[str, Path]] = None,
+        t3_dtype: str = "float32",
+        quantize_bits: Optional[int] = None,
+        mlx_cache_limit_gb: float = 2.0,
     ) -> "ChatterboxMultilingualTTSMLX":
         """
         Load model from local checkpoint directory.
+
+        The defaults load the 1.2.0 model: fp32 T3 and the PyTorch S3Gen.
 
         Args:
             ckpt_dir: Path to checkpoint directory
             t3_config: Optional T3 configuration
             use_default_speaker: Whether to load default speaker
             device: PyTorch device for S3Gen
+            vocoder: ``"pt"`` (default): PyTorch S3Gen on ``device``, 5 steps.
+                ``"mlx"``: the same ``s3gen.pt`` weights on MLX, 5 steps.
+                ``"meanflow"``: Turbo's meanflow S3Gen on MLX, 2 steps
+                (fastest; speaker similarity about 0.01-0.02 lower). With an
+                MLX vocoder the PyTorch S3Gen keeps only its conditioning
+                encoders (its flow and HiFiGAN are dropped).
+            meanflow_path: ``s3gen_meanflow.safetensors``, or a directory that
+                holds it (the local ``ResembleAI/chatterbox-turbo``
+                snapshot). Only for ``vocoder="meanflow"``; ``None`` looks in
+                ``ckpt_dir``. Nothing is downloaded (see
+                :func:`resolve_meanflow_path`).
+            t3_dtype: ``"float32"`` (default) or ``"float16"`` T3 weights
+                (``"fp32"`` / ``"fp16"`` also accepted). fp16 roughly halves
+                the T3 time per token on the fast decode loop.
+            quantize_bits: ``None`` (default), 8 or 4: weight-only quantization
+                of T3 (group size 64). Off by default: q8 is not yet
+                validated on every language.
+            mlx_cache_limit_gb: See :meth:`__init__`.
 
         Returns:
             ChatterboxMultilingualTTSMLX instance
         """
         ckpt_dir = Path(ckpt_dir)
+        _check_vocoder(vocoder)
+        meanflow_file = (
+            resolve_meanflow_path(meanflow_path, ckpt_dir)
+            if vocoder == "meanflow"
+            else None
+        )
+        if t3_dtype not in T3_DTYPES:
+            raise ValueError(
+                f"t3_dtype must be one of {list(T3_DTYPES)}, got {t3_dtype!r}"
+            )
+        if quantize_bits not in (None, 4, 8):
+            raise ValueError("quantize_bits must be None, 4 or 8")
 
         # Check MPS availability
         if device == "mps" and not torch.backends.mps.is_available():
@@ -474,6 +732,12 @@ class ChatterboxMultilingualTTSMLX:
         t3.load_weights(list(mlx_state.items()), strict=False)
         t3.eval()  # Set to eval mode to disable dropout
         logger.info("✓ T3 multilingual weights loaded successfully")
+        if T3_DTYPES[t3_dtype] != "float32" or quantize_bits is not None:
+            logger.info(
+                f"T3 precision: dtype={t3_dtype}, quantize_bits={quantize_bits}"
+            )
+            del mlx_state, pt_state
+            apply_t3_precision(t3, t3_dtype, quantize_bits)
 
         # Load S3Gen (PyTorch/MPS) - hybrid approach
         logger.info(f"Loading S3Gen vocoder (PyTorch on {device})...")
@@ -485,6 +749,14 @@ class ChatterboxMultilingualTTSMLX:
                 ckpt_dir / "s3gen.pt", weights_only=True, map_location=map_location
             )
         )
+        s3gen_mlx = None
+        if vocoder != "pt":
+            # Only embed_ref (mel extractor, speaker encoder, S3 tokenizer)
+            # runs in torch; its flow and HiFiGAN would be a second vocoder.
+            del s3gen.flow, s3gen.mel2wav
+            weights = meanflow_file if vocoder == "meanflow" else ckpt_dir / "s3gen.pt"
+            logger.info(f"Loading {vocoder} S3Gen vocoder (MLX) from {weights}...")
+            s3gen_mlx = load_mlx_vocoder(weights, meanflow=vocoder == "meanflow")
         s3gen.to(device).eval()
         logger.info("✓ S3Gen loaded successfully")
 
@@ -505,7 +777,12 @@ class ChatterboxMultilingualTTSMLX:
 
         logger.info("✅ ChatterboxMultilingualTTSMLX loaded successfully!")
         logger.info("   T3: MLX (Apple Silicon optimized)")
-        logger.info(f"   S3Gen: PyTorch on {device}")
+        if vocoder == "pt":
+            logger.info(f"   S3Gen: PyTorch on {device}")
+        else:
+            logger.info(
+                f"   S3Gen: MLX ({vocoder}); conditioning in PyTorch on {device}"
+            )
         logger.info(f"   Supported languages: {len(SUPPORTED_LANGUAGES)}")
 
         return cls(
@@ -515,8 +792,58 @@ class ChatterboxMultilingualTTSMLX:
             tokenizer=tokenizer,
             device=device,
             conds=conds,
+            vocoder=vocoder,
+            s3gen_mlx=s3gen_mlx,
+            mlx_cache_limit_gb=mlx_cache_limit_gb,
         )
 
+    def _check_no_stream(self) -> None:
+        # Another thread waits on the lock; this one re-enters it. A stream
+        # suspended mid-decode shares T3's state and the conditioning.
+        if self._stream_active:
+            raise RuntimeError(
+                "A generate_stream() generator is open on this instance; "
+                "exhaust or close() it first."
+            )
+
+    def _mlx_ref_dict(self) -> dict:
+        """``self.conds.gen`` in the MLX vocoder's layout (cached per conds)."""
+        gen = self.conds.gen
+        if self._mlx_ref is None or self._mlx_ref_src is not gen:
+            with TORCH_LOCK:
+                ref = ref_dict_to_mlx(gen)
+            materialize_mlx_state(ref)
+            self._mlx_ref_src, self._mlx_ref = gen, ref
+        return self._mlx_ref
+
+    def _vocoder_host(self) -> MLXVocoderHost:
+        return MLXVocoderHost(
+            self.s3gen_mlx, self._mlx_ref_dict(), self.mlx_cache_limit
+        )
+
+    def _cfm_steps(self, n_cfm_timesteps: Optional[int]) -> Optional[int]:
+        if n_cfm_timesteps is not None:
+            return int(n_cfm_timesteps)
+        return DEFAULT_CFM_STEPS[self.vocoder]
+
+    def _vocode_mlx(
+        self, speech_tokens: np.ndarray, seed: Optional[int], n_cfm_timesteps
+    ) -> np.ndarray:
+        """Vocode one chunk's speech ids (``< 6561``) with the MLX vocoder.
+
+        ``"meanflow"`` appends 3 silence tokens and runs S3Gen in final mode,
+        as Turbo. ``"mlx"`` runs non-final with no silence tokens, as the
+        PyTorch path (its lookahead trim drops the last 3 tokens' mel).
+        """
+        tokens = np.asarray(speech_tokens).reshape(-1).astype(np.int64)
+        steps = self._cfm_steps(n_cfm_timesteps)
+        host = self._vocoder_host()
+        if self.vocoder == "meanflow":
+            tokens = np.concatenate([tokens, np.full(3, S3GEN_SIL, dtype=np.int64)])
+            return host._vocode(tokens, steps, seed, finalize=True)
+        return host._vocode(tokens, steps, seed, finalize=False)
+
+    @_exclusive
     def prepare_conditionals(self, wav_fpath: str, exaggeration: float = 0.5):
         """
         Prepare conditioning from a reference audio file.
@@ -576,6 +903,7 @@ class ChatterboxMultilingualTTSMLX:
             self.conds = Conditionals(t3_cond, s3gen_ref_dict)
             materialize_mlx_state(self.conds)
 
+    @_exclusive
     def generate(
         self,
         text: str,
@@ -590,6 +918,7 @@ class ChatterboxMultilingualTTSMLX:
         max_new_tokens: Optional[int] = None,
         show_progress: bool = True,
         seed: Optional[int] = None,
+        n_cfm_timesteps: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate speech from text using hybrid MLX/PyTorch pipeline.
@@ -611,6 +940,8 @@ class ChatterboxMultilingualTTSMLX:
             seed: Random seed for deterministic generation. If None (default),
                   uses non-deterministic generation. Set to an integer (e.g., 42)
                   for reproducible results.
+            n_cfm_timesteps: S3Gen CFM steps; None (default) uses the
+                  vocoder's default (5, or 2 for ``"meanflow"``).
 
         Returns:
             Generated audio waveform as torch tensor
@@ -634,34 +965,14 @@ class ChatterboxMultilingualTTSMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        with TORCH_LOCK:
-            if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
-                _cond = self.conds.t3
-                self.conds.t3 = T3Cond(
-                    speaker_emb=_cond.speaker_emb,
-                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
-                ).to(device=self.device)
+        self._set_exaggeration(exaggeration)
 
         # Normalize text
         text = punc_norm(text)
 
         # Split text into sentences for optimal generation
         lang = language_id.lower() if language_id else "en"
-        if SPACY_AVAILABLE:
-            sentences = split_into_sentences(text, lang=lang)
-        else:
-            sentences = [text]
-
-        # Clean up each sentence (remove orphaned quotes from splitting)
-        sentences = [punc_norm(s, debug=False) for s in sentences]
-        # Filter out empty sentences
-        sentences = [s for s in sentences if s and s.strip()]
-
-        # Merge short sentences so no chunk is small enough to hallucinate.
-        # Runs after punc_norm, so quotes are already stripped and the
-        # merge cannot strand one mid-text.
-        sentences = merge_short_sentences(sentences, MIN_CHUNK_WORDS)
+        sentences = self._plan_sentences(text, lang)
 
         total_words = count_words(text)
         num_chunks = len(sentences)
@@ -700,6 +1011,7 @@ class ChatterboxMultilingualTTSMLX:
                 top_p=top_p,
                 show_progress=show_progress,  # Use caller's preference
                 seed=internal_seed,
+                n_cfm_timesteps=n_cfm_timesteps,
             )
 
             gen_time = _time.time() - gen_start
@@ -751,6 +1063,7 @@ class ChatterboxMultilingualTTSMLX:
                 top_p=top_p,
                 show_progress=False,  # Suppress token progress, observability handles chunk progress
                 seed=chunk_seed,
+                n_cfm_timesteps=n_cfm_timesteps,
             )
 
             chunk_time = _time.time() - chunk_start
@@ -787,6 +1100,325 @@ class ChatterboxMultilingualTTSMLX:
             else result.unsqueeze(0)
         )
 
+    def _set_exaggeration(self, exaggeration: float) -> None:
+        """Rebuild ``conds.t3`` when ``exaggeration`` differs from its emotion value."""
+        with TORCH_LOCK:
+            if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+                _cond = self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                ).to(device=self.device)
+
+    @staticmethod
+    def _plan_sentences(text: str, lang: str) -> List[str]:
+        """generate()'s chunk plan for normalized ``text``: sentences, short ones merged."""
+        if SPACY_AVAILABLE:
+            sentences = split_into_sentences(text, lang=lang)
+        else:
+            sentences = [text]
+
+        # Clean up each sentence (remove orphaned quotes from splitting)
+        sentences = [punc_norm(s, debug=False) for s in sentences]
+        # Filter out empty sentences
+        sentences = [s for s in sentences if s and s.strip()]
+
+        # Merge short sentences so no chunk is small enough to hallucinate.
+        # Runs after punc_norm, so quotes are already stripped and the
+        # merge cannot strand one mid-text.
+        return merge_short_sentences(sentences, MIN_CHUNK_WORDS)
+
+    def generate_stream(
+        self,
+        text: str,
+        language_id: str,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+        repetition_penalty: float = 2.0,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+        max_new_tokens: Optional[int] = None,
+        seed: Optional[int] = None,
+        *,
+        n_cfm_timesteps: Optional[int] = None,
+        overlap_duration: float = 0.01,
+        first_chunk_tokens: int = STREAM_FIRST_CHUNK_TOKENS,
+        chunk_tokens: int = MTL_STREAM_CHUNK_TOKENS,
+        context_tokens: int = STREAM_CONTEXT_TOKENS,
+        lookahead_tokens: int = STREAM_LOOKAHEAD_TOKENS,
+    ) -> Iterator[np.ndarray]:
+        """Synthesize ``text`` and yield 1-D float32 pieces at :attr:`sr` as they are ready.
+
+        The pieces concatenate to one waveform; play them in order. The
+        arguments shared with :meth:`generate` mean the same, and the text is
+        cut into the same sentence chunks. Chunk ``i`` uses ``seed + i``.
+        Chunks decode one after another and join with the same crossfade as
+        :meth:`generate` (``overlap_duration``, default 10 ms).
+
+        * With an MLX vocoder (``"meanflow"``, recommended, or ``"mlx"``)
+          every chunk is vocoded on growing token windows while T3 still
+          decodes it, as Turbo's ``generate_stream``: the first window after
+          ``first_chunk_tokens`` tokens (plus ``lookahead_tokens``), the next
+          after ``chunk_tokens`` more (default 40; Turbo uses 50), then
+          windows double up to 200 tokens. Each window re-vocodes
+          ``context_tokens`` tokens on its left (see
+          :class:`~chatterbox.streaming_mlx._WindowVocoder`). A chunk ends
+          with 3 silence tokens and a final-mode S3Gen call (as Turbo).
+          A chunk that ends before its first window is vocoded once.
+        * ``first_chunk_tokens=0``, or ``vocoder="pt"``: each chunk is
+          yielded whole when it is done; the pieces then equal
+          :meth:`generate` with the same seed.
+
+        With ``"meanflow"`` a windowed chunk matches a whole-chunk vocode of
+        the same tokens closely but not bit for bit (window joins). With
+        ``"mlx"`` (5 steps) the windows are slower than real time on typical
+        hardware and playback can gap; prefer ``"meanflow"`` for streaming.
+
+        Time to first audio needs a T3 that yields tokens while it decodes
+        (``T3MLX.generate_stream``). Without one, each chunk's tokens are
+        decoded first and then fed to the windows (same audio, later).
+
+        Watermark: no watermark is applied, as in :meth:`generate` (see the
+        note in :meth:`__init__`).
+
+        The generator holds the instance lock until it is exhausted or
+        closed: other threads wait, and calling :meth:`generate`,
+        :meth:`generate_long`, :meth:`generate_stream` or
+        :meth:`prepare_conditionals` of this instance from the loop raises
+        ``RuntimeError``.
+
+        :attr:`last_timings` is set when the generator ends: ``t3_s`` and
+        ``s3gen_s`` (windowed chunks), ``wall_s``, ``first_audio_s`` (call to
+        first piece), ``n_speech_tokens`` (windowed chunks), ``n_chunks``,
+        ``n_pieces``, ``n_windows`` (S3Gen window calls) and ``vocoder``.
+        """
+        with self._lock:
+            self._check_no_stream()
+            first_chunk_tokens = int(first_chunk_tokens)
+            if first_chunk_tokens and first_chunk_tokens < 2:
+                raise ValueError("first_chunk_tokens must be 0 or >= 2")
+            if lookahead_tokens < S3GEN_PRE_LOOKAHEAD:
+                raise ValueError(f"lookahead_tokens must be >= {S3GEN_PRE_LOOKAHEAD}")
+            if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+                supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+                raise ValueError(
+                    f"Unsupported language_id '{language_id}'. "
+                    f"Supported languages: {supported_langs}"
+                )
+            t_start = time.perf_counter()
+            if audio_prompt_path:
+                self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            elif self.conds is None:
+                raise ValueError(
+                    "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+                )
+            if not text or not text.strip():
+                self.last_timings = {"n_chunks": 0}
+                return
+            self._set_exaggeration(exaggeration)
+
+            lang = language_id.lower() if language_id else "en"
+            sentences = self._plan_sentences(punc_norm(text), lang)
+            internal_seed = (
+                seed if seed is not None else int(time.time() * 1000) % (2**31)
+            )
+            n = len(sentences)
+            joiner = _ChunkJoiner(n, self.sr, overlap_duration)
+            t = {
+                "t3_s": 0.0,
+                "s3gen_s": 0.0,
+                "wall_s": 0.0,
+                "first_audio_s": None,
+                "n_speech_tokens": 0,
+                "n_chunks": n,
+                "n_pieces": 0,
+                "n_windows": 0,
+                "vocoder": self.vocoder,
+            }
+
+            def out(wav: np.ndarray, last: bool) -> np.ndarray:
+                y = joiner.push(wav)
+                if last:
+                    y = np.concatenate([y, joiner.finish()])
+                # Watermark: intentionally not applied (see __init__).
+                if len(y):
+                    t["n_pieces"] += 1
+                    if t["first_audio_s"] is None:
+                        t["first_audio_s"] = time.perf_counter() - t_start
+                return y
+
+            sample = dict(
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+            windowed = bool(first_chunk_tokens) and self.vocoder != "pt"
+            self._stream_active += 1
+            try:
+                for i, sentence in enumerate(sentences):
+                    chunk_seed = internal_seed + i
+                    last = i == n - 1
+                    joiner.begin_chunk()
+                    if windowed:
+                        yield from self._stream_chunk(
+                            sentence,
+                            language_id,
+                            chunk_seed,
+                            max_new_tokens,
+                            sample,
+                            n_cfm_timesteps,
+                            t,
+                            out,
+                            last=last,
+                            first_chunk_tokens=first_chunk_tokens,
+                            chunk_tokens=max(1, int(chunk_tokens)),
+                            context_tokens=max(0, int(context_tokens)),
+                            lookahead_tokens=int(lookahead_tokens),
+                        )
+                        continue
+                    wav = self._generate_single(
+                        sentence,
+                        language_id=language_id,
+                        max_new_tokens=max_new_tokens,
+                        show_progress=False,
+                        seed=chunk_seed,
+                        n_cfm_timesteps=n_cfm_timesteps,
+                        **sample,
+                    )
+                    y = out(wav.numpy().reshape(-1), last=last)
+                    if len(y):
+                        yield y
+            finally:
+                self._stream_active -= 1
+                t["wall_s"] = time.perf_counter() - t_start
+                self.last_timings = t
+                self.last_generation_time = t["wall_s"]
+        if self.vocoder == "pt":
+            clear_device_memory()
+
+    def _stream_chunk(
+        self,
+        text: str,
+        language_id: str,
+        seed: int,
+        max_new_tokens: Optional[int],
+        sample: dict,
+        n_cfm_timesteps: Optional[int],
+        t: dict,
+        out,
+        *,
+        last: bool,
+        first_chunk_tokens: int,
+        chunk_tokens: int,
+        context_tokens: int,
+        lookahead_tokens: int,
+    ) -> Iterator[np.ndarray]:
+        """Token-window streaming of one chunk (see :meth:`generate_stream`)."""
+        text, text_tokens_mx, t3_cond_mx, max_new_tokens = self._prepare_t3_inputs(
+            text, language_id, sample["cfg_weight"], max_new_tokens, seed
+        )
+        voc = _WindowVocoder(
+            self._vocoder_host(),
+            seed=seed,
+            n_cfm_timesteps=self._cfm_steps(n_cfm_timesteps),
+            max_tokens=max_new_tokens + 1,
+            first_chunk_tokens=first_chunk_tokens,
+            chunk_tokens=chunk_tokens,
+            context_tokens=context_tokens,
+            lookahead_tokens=lookahead_tokens,
+        )
+        blocks = self._t3_token_blocks(
+            t3_cond=t3_cond_mx,
+            text_tokens=text_tokens_mx,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+            **sample,
+        )
+        all_ids = []
+        try:
+            t0 = time.perf_counter()
+            for ids in blocks:
+                ids = np.asarray(ids).reshape(-1).astype(np.int64)
+                all_ids.append(ids)
+                t["t3_s"] += time.perf_counter() - t0
+                t1 = time.perf_counter()
+                wavs = list(voc.feed(ids))
+                t["s3gen_s"] += time.perf_counter() - t1
+                for wav in wavs:
+                    y = out(wav, last=False)
+                    if len(y):
+                        yield y
+                t0 = time.perf_counter()
+            t["t3_s"] += time.perf_counter() - t0
+        finally:
+            # Close T3's generator here (on this thread), not at garbage collection.
+            close = getattr(blocks, "close", None)
+            if close is not None:
+                close()
+
+        ids = np.concatenate(all_ids) if all_ids else np.zeros((0,), np.int64)
+        with TORCH_LOCK:
+            # The same EOS warning and debug output as generate().
+            n_speech = len(self._postprocess_speech_tokens(ids, text))
+        t["n_speech_tokens"] += n_speech
+        t1 = time.perf_counter()
+        wav = voc.finish()
+        t["s3gen_s"] += time.perf_counter() - t1
+        t["n_windows"] += voc.n_windows
+        y = out(wav, last=last)
+        if len(y):
+            yield y
+
+    def _t3_token_blocks(
+        self, *, block_tokens: int = STREAM_BLOCK_TOKENS, seed=None, **t3_kwargs
+    ) -> Iterator[np.ndarray]:
+        """T3 speech ids of one chunk, in blocks of ``block_tokens``, while T3 decodes.
+
+        Uses ``T3MLX.generate_tokens`` (the fast decode loop). It samples from
+        MLX's global RNG, which :meth:`_prepare_t3_inputs` seeded. A T3
+        without it decodes the whole chunk with ``inference`` first; its ids
+        are then cut into blocks (same ids, no early audio).
+
+        Between blocks the window vocoder re-seeds MLX's RNG for its own
+        noise. So with windows, T3 samples after the first window differ
+        from :meth:`generate` with the same seed; they stay deterministic
+        for a given seed.
+        """
+        block_tokens = max(1, int(block_tokens))
+        gen_tokens = getattr(self.t3, "generate_tokens", None)
+        if not callable(gen_tokens):
+            yield from self._t3_blocks_after_decode(block_tokens, seed, t3_kwargs)
+            return
+        tokens = gen_tokens(**t3_kwargs, show_progress=False)
+        try:
+            block = []
+            for tok in tokens:
+                block.append(int(tok))
+                if len(block) >= block_tokens:
+                    yield np.asarray(block, dtype=np.int64)
+                    block = []
+            if block:
+                yield np.asarray(block, dtype=np.int64)
+        finally:
+            close = getattr(tokens, "close", None)
+            if close is not None:
+                close()
+
+    def _t3_blocks_after_decode(
+        self, block_tokens: int, seed, t3_kwargs: dict
+    ) -> Iterator[np.ndarray]:
+        with torch.inference_mode():
+            toks = self.t3.inference(**t3_kwargs, seed=seed, show_progress=False)
+        ids = np.array(toks[0] if len(toks.shape) > 1 else toks)
+        ids = ids.reshape(-1).astype(np.int64)
+        for i in range(0, len(ids), block_tokens):
+            yield ids[i : i + block_tokens]
+
     def _generate_single(
         self,
         text: str,
@@ -799,6 +1431,7 @@ class ChatterboxMultilingualTTSMLX:
         top_p: float = 1.0,
         show_progress: bool = True,
         seed: Optional[int] = None,
+        n_cfm_timesteps: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate speech for a single sentence/chunk (internal method).
@@ -814,12 +1447,70 @@ class ChatterboxMultilingualTTSMLX:
             top_p: Nucleus sampling threshold
             show_progress: Whether to show token-level progress bar
             seed: Random seed for deterministic generation
+            n_cfm_timesteps: S3Gen CFM steps (None: the vocoder's default)
 
         Returns:
             Generated audio waveform as torch tensor
         """
+        text, text_tokens_mx, t3_cond_mx, max_new_tokens = self._prepare_t3_inputs(
+            text, language_id, cfg_weight, max_new_tokens, seed
+        )
+
+        # Generate speech tokens with T3 MLX
+        with torch.inference_mode():
+            speech_tokens_mx = self.t3.inference(
+                t3_cond=t3_cond_mx,
+                text_tokens=text_tokens_mx,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                show_progress=show_progress,
+                seed=seed,
+            )
+
+        # Extract conditional batch (first one)
+        speech_tokens = (
+            speech_tokens_mx[0] if len(speech_tokens_mx.shape) > 1 else speech_tokens_mx
+        )
+
+        # Convert back to PyTorch for S3Gen
+        speech_tokens_np = np.array(speech_tokens).astype(np.int64)
+        with TORCH_LOCK:
+            speech_tokens_pt = self._postprocess_speech_tokens(speech_tokens_np, text)
+            if self.vocoder == "pt":
+                wav = self._vocode_pt(speech_tokens_pt, seed, n_cfm_timesteps)
+            else:
+                speech_ids = speech_tokens_pt.numpy()
+        if self.vocoder != "pt":
+            # MLX vocoder: outside TORCH_LOCK (no torch work).
+            wav = self._vocode_mlx(speech_ids, seed, n_cfm_timesteps)
+
+        if os.getenv("CHATTERBOX_DEBUG"):
+            wav_duration = len(wav) / self.sr
+            print(
+                f"[DEBUG] S3Gen output: {len(wav)} samples = {wav_duration:.2f}s @ {self.sr}Hz"
+            )
+            print(f"[DEBUG] Text preview: {text[:60]}...")
+
+        return torch.from_numpy(wav).unsqueeze(0)
+
+    def _prepare_t3_inputs(
+        self,
+        text: str,
+        language_id: str,
+        cfg_weight: float,
+        max_new_tokens: Optional[int],
+        seed: Optional[int],
+    ):
+        """Seed the RNGs, normalize and tokenize ``text``, convert the T3 conditioning.
+
+        Returns ``(text, text_tokens_mx, t3_cond_mx, max_new_tokens)``.
+        """
         # Seed all RNGs if seed is provided (for both T3 MLX and S3Gen PyTorch)
-        # Torch work only; T3 below runs on MLX, outside the lock.
+        # Torch work only; T3 runs on MLX, outside the lock.
         with TORCH_LOCK:
             if seed is not None:
                 # Set all seeds
@@ -880,123 +1571,97 @@ class ChatterboxMultilingualTTSMLX:
                 ),
                 emotion_adv=float(self.conds.t3.emotion_adv[0, 0, 0].item()),
             )
+        return text, text_tokens_mx, t3_cond_mx, max_new_tokens
 
-            # Generate speech tokens with T3 MLX
-        with torch.inference_mode():
-            speech_tokens_mx = self.t3.inference(
-                t3_cond=t3_cond_mx,
-                text_tokens=text_tokens_mx,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                show_progress=show_progress,
-                seed=seed,
+    def _postprocess_speech_tokens(self, speech_tokens_np: np.ndarray, text: str):
+        """T3 ids -> the speech ids S3Gen vocodes (CPU tensor). Call under TORCH_LOCK."""
+        speech_tokens_pt = torch.from_numpy(speech_tokens_np)
+
+        # DEBUG: Log token counts before filtering
+        # Missing EOS means generation ran to the token cap instead of
+        # deciding it was finished -- the signature of a hallucinated
+        # tail. Warn unconditionally: the absence of the existing
+        # "EOS detected" info log is not something a bulk run can grep
+        # for, so this failure was previously silent in production.
+        if not (speech_tokens_pt == 6562).any().item():
+            logger.warning(
+                "no EOS token: generation used all %d tokens for %d-word text "
+                "(%r) -- output may contain hallucinated audio",
+                len(speech_tokens_pt),
+                count_words(text),
+                text[:60],
             )
-
-        # Extract conditional batch (first one)
-        speech_tokens = (
-            speech_tokens_mx[0] if len(speech_tokens_mx.shape) > 1 else speech_tokens_mx
-        )
-
-        # Convert back to PyTorch for S3Gen
-        speech_tokens_np = np.array(speech_tokens).astype(np.int64)
-        with TORCH_LOCK:
-            speech_tokens_pt = torch.from_numpy(speech_tokens_np)
-
-            # DEBUG: Log token counts before filtering
-            # Missing EOS means generation ran to the token cap instead of
-            # deciding it was finished -- the signature of a hallucinated
-            # tail. Warn unconditionally: the absence of the existing
-            # "EOS detected" info log is not something a bulk run can grep
-            # for, so this failure was previously silent in production.
-            if not (speech_tokens_pt == 6562).any().item():
-                logger.warning(
-                    "no EOS token: generation used all %d tokens for %d-word text "
-                    "(%r) -- output may contain hallucinated audio",
-                    len(speech_tokens_pt),
-                    count_words(text),
-                    text[:60],
-                )
-
-            if os.getenv("CHATTERBOX_DEBUG"):
-                print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
-                print(
-                    f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
-                )
-                # Check for SOS/EOS
-                SOS, EOS = 6561, 6562
-                has_sos = (speech_tokens_pt == SOS).any().item()
-                has_eos = (speech_tokens_pt == EOS).any().item()
-                if has_sos:
-                    sos_pos = (
-                        (speech_tokens_pt == SOS).nonzero(as_tuple=True)[0][0].item()
-                    )
-                    print(f"[DEBUG] SOS (6561) found at position {sos_pos}")
-                if has_eos:
-                    eos_pos = (
-                        (speech_tokens_pt == EOS).nonzero(as_tuple=True)[0][0].item()
-                    )
-                    print(f"[DEBUG] EOS (6562) found at position {eos_pos}")
-                    print(
-                        f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}"
-                    )
-                else:
-                    print(
-                        "[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens"
-                    )
-                # Count special tokens
-                num_special = (speech_tokens_pt >= 6561).sum().item()
-                print(f"[DEBUG] Special tokens (>=6561): {num_special}")
-
-            # Drop invalid tokens (SOS/EOS)
-            speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
-
-            if os.getenv("CHATTERBOX_DEBUG"):
-                print(
-                    f"[DEBUG] After drop_invalid_tokens: {len(speech_tokens_pt)} tokens"
-                )
-
-            # Filter out tokens >= 6561 (special tokens)
-            speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
-
-            if os.getenv("CHATTERBOX_DEBUG"):
-                print(
-                    f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens"
-                )
-                print(
-                    f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
-                )
-
-            speech_tokens_pt = speech_tokens_pt.to(self.device)
-
-            # Re-seed PyTorch RNG right before S3Gen to ensure determinism
-            # This is necessary because T3 generation may have consumed random numbers
-            if seed is not None:
-                torch.manual_seed(seed)
-                np.random.seed(seed)
-
-            # Generate waveform with S3Gen (PyTorch/MPS)
-            with torch.inference_mode():
-                wav, sources = self.s3gen.inference(
-                    speech_tokens=speech_tokens_pt,
-                    ref_dict=self.conds.gen,
-                    finalize=False,  # Enable lookahead trimming to prevent extra audio generation
-                )
-                if sources is not None:
-                    del sources
-                wav = wav.squeeze(0).detach().cpu().numpy()
 
         if os.getenv("CHATTERBOX_DEBUG"):
-            wav_duration = len(wav) / self.sr
+            print(f"[DEBUG] T3 generated {len(speech_tokens_pt)} tokens")
             print(
-                f"[DEBUG] S3Gen output: {len(wav)} samples = {wav_duration:.2f}s @ {self.sr}Hz"
+                f"[DEBUG] Token stats: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
             )
-            print(f"[DEBUG] Text preview: {text[:60]}...")
+            # Check for SOS/EOS
+            SOS, EOS = 6561, 6562
+            has_sos = (speech_tokens_pt == SOS).any().item()
+            has_eos = (speech_tokens_pt == EOS).any().item()
+            if has_sos:
+                sos_pos = (speech_tokens_pt == SOS).nonzero(as_tuple=True)[0][0].item()
+                print(f"[DEBUG] SOS (6561) found at position {sos_pos}")
+            if has_eos:
+                eos_pos = (speech_tokens_pt == EOS).nonzero(as_tuple=True)[0][0].item()
+                print(f"[DEBUG] EOS (6562) found at position {eos_pos}")
+                print(
+                    f"[DEBUG] Tokens after EOS: {len(speech_tokens_pt) - eos_pos - 1}"
+                )
+            else:
+                print(
+                    "[DEBUG] WARNING: No EOS token found! Generation may have hit max_new_tokens"
+                )
+            # Count special tokens
+            num_special = (speech_tokens_pt >= 6561).sum().item()
+            print(f"[DEBUG] Special tokens (>=6561): {num_special}")
 
-        return torch.from_numpy(wav).unsqueeze(0)
+        # Drop invalid tokens (SOS/EOS)
+        speech_tokens_pt = drop_invalid_tokens(speech_tokens_pt)
+
+        if os.getenv("CHATTERBOX_DEBUG"):
+            print(f"[DEBUG] After drop_invalid_tokens: {len(speech_tokens_pt)} tokens")
+
+        # Filter out tokens >= 6561 (special tokens)
+        speech_tokens_pt = speech_tokens_pt[speech_tokens_pt < 6561]
+
+        if os.getenv("CHATTERBOX_DEBUG"):
+            print(
+                f"[DEBUG] After filtering special tokens: {len(speech_tokens_pt)} tokens"
+            )
+            print(
+                f"[DEBUG] Final token range: min={speech_tokens_pt.min().item()}, max={speech_tokens_pt.max().item()}"
+            )
+
+        return speech_tokens_pt
+
+    def _vocode_pt(self, speech_tokens_pt, seed: Optional[int], n_cfm_timesteps):
+        """The 1.2.0 vocoder: PyTorch S3Gen, non-final. Call under TORCH_LOCK."""
+        speech_tokens_pt = speech_tokens_pt.to(self.device)
+
+        # Re-seed PyTorch RNG right before S3Gen to ensure determinism
+        # This is necessary because T3 generation may have consumed random numbers
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        # Generate waveform with S3Gen (PyTorch/MPS)
+        kwargs = {}
+        if n_cfm_timesteps is not None:
+            kwargs["n_cfm_timesteps"] = int(n_cfm_timesteps)
+        with torch.inference_mode():
+            wav, sources = self.s3gen.inference(
+                speech_tokens=speech_tokens_pt,
+                ref_dict=self.conds.gen,
+                finalize=False,  # Enable lookahead trimming to prevent extra audio generation
+                **kwargs,
+            )
+            if sources is not None:
+                del sources
+            wav = wav.squeeze(0).detach().cpu().numpy()
+        return wav
 
     def _split_text_intelligently(
         self, text: str, language_id: str, target_words_per_chunk: int = 50
@@ -1021,6 +1686,7 @@ class ChatterboxMultilingualTTSMLX:
         result = crossfade_chunks(chunks, self.sr, overlap_duration)
         return result.numpy() if isinstance(result, torch.Tensor) else result
 
+    @_exclusive
     def generate_long(
         self,
         text: str,
@@ -1037,6 +1703,7 @@ class ChatterboxMultilingualTTSMLX:
         progress_callback=None,
         show_progress: bool = False,
         seed: Optional[int] = None,
+        n_cfm_timesteps: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate long-form speech with adaptive chunking strategy.
@@ -1059,6 +1726,7 @@ class ChatterboxMultilingualTTSMLX:
             max_new_tokens: Maximum tokens to generate per chunk
             progress_callback: Optional callback function for progress monitoring
             seed: Random seed for deterministic generation
+            n_cfm_timesteps: S3Gen CFM steps (None: the vocoder's default)
 
         Returns:
             torch.Tensor: Generated audio waveform with shape (1, num_samples)
@@ -1086,14 +1754,7 @@ class ChatterboxMultilingualTTSMLX:
             ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        with TORCH_LOCK:
-            if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
-                _cond = self.conds.t3
-                self.conds.t3 = T3Cond(
-                    speaker_emb=_cond.speaker_emb,
-                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                    emotion_adv=exaggeration * torch.ones(1, 1, 1),
-                ).to(device=self.device)
+        self._set_exaggeration(exaggeration)
 
         # Get adaptive chunks based on text length
         lang = language_id.lower() if language_id else "en"
@@ -1160,6 +1821,7 @@ class ChatterboxMultilingualTTSMLX:
                 top_p=top_p,
                 show_progress=False,  # Suppress token progress, observability handles chunk progress
                 seed=chunk_seed,
+                n_cfm_timesteps=n_cfm_timesteps,
             )
 
             chunk_time = _time.time() - chunk_start
