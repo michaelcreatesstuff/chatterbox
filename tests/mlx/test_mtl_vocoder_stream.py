@@ -60,7 +60,7 @@ class _HP:
 
 
 class _T3Stub:
-    """Tokens depend only on the seed and the text length; EOS last."""
+    """Tokens depend on MLX's global RNG (seeded by the pipeline) and the text length; EOS last."""
 
     tokens_per_text_token = 8
 
@@ -68,34 +68,35 @@ class _T3Stub:
         self.hp = _HP()
         self.calls = []
 
-    def _ids(self, text_tokens, max_new_tokens, seed):
+    def _ids(self, text_tokens, max_new_tokens):
         n = min(
             max_new_tokens - 1, self.tokens_per_text_token * int(text_tokens.shape[1])
         )
-        rng = np.random.default_rng(0 if seed is None else seed)
+        rng = np.random.default_rng(int(mx.random.randint(0, 2**31, ()).item()))
         return np.concatenate([rng.integers(0, 6561, n), [EOS]]).astype(np.int64)
 
     def inference(self, *, t3_cond, text_tokens, max_new_tokens, seed=None, **kw):
         self.calls.append(dict(max_new_tokens=max_new_tokens, seed=seed, **kw))
-        return mx.array(self._ids(text_tokens, max_new_tokens, seed)[None])
+        return mx.array(self._ids(text_tokens, max_new_tokens)[None])
 
 
 class _StreamingT3Stub(_T3Stub):
-    """Also has the fast loop's ``generate_stream`` (yields id blocks)."""
+    """Also has the fast loop's ``generate_tokens`` (yields one id at a time)."""
 
     def __init__(self):
         super().__init__()
         self.stream_state = []  # per call: {"done": bool, "closed": bool}
 
-    def generate_stream(
-        self, *, t3_cond, text_tokens, max_new_tokens, seed=None, block_tokens=4, **kw
+    def generate_tokens(
+        self, *, t3_cond, text_tokens, max_new_tokens, show_progress=False, **kw
     ):
+        assert "seed" not in kw  # the caller seeds MLX's RNG
         state = {"done": False, "closed": False}
         self.stream_state.append(state)
-        ids = self._ids(text_tokens, max_new_tokens, seed)
+        ids = self._ids(text_tokens, max_new_tokens)
         try:
-            for i in range(0, len(ids), block_tokens):
-                yield ids[i : i + block_tokens]
+            for tok in ids:
+                yield int(tok)
             state["done"] = True
         finally:
             state["closed"] = True
@@ -224,7 +225,7 @@ class TestDefaults(_Base):
             self.assertEqual(p["vocoder"].default, "pt")
         for fn in (cls.from_local, cls.from_pretrained):
             p = inspect.signature(fn).parameters
-            self.assertEqual(p["t3_dtype"].default, "fp32")
+            self.assertEqual(p["t3_dtype"].default, "float32")
             self.assertIsNone(p["quantize_bits"].default)
             self.assertIsNone(p["meanflow_path"].default)
         # Positional order of the 1.2.0 arguments is unchanged.
@@ -334,6 +335,7 @@ class TestT3Precision(unittest.TestCase):
         m = _TinyT3()
         w = m.tfmr.layers[0].weight
         self.assertIs(M.apply_t3_precision(m, "fp32", None), m)
+        self.assertIs(M.apply_t3_precision(m), m)
         self.assertIs(m.tfmr.layers[0].weight, w)
         self.assertEqual(w.dtype, mx.float32)
 
@@ -346,7 +348,7 @@ class TestT3Precision(unittest.TestCase):
 
     def test_uses_t3_finalize_when_present(self):
         class WithFinalize(_TinyT3):
-            def finalize(self, dtype, quantize_bits=None):
+            def finalize(self, dtype="float32", quantize_bits=None, group_size=64):
                 self.finalized = (dtype, quantize_bits)
 
         m = WithFinalize()
@@ -423,7 +425,8 @@ class TestStream(_Base):
         self.assertEqual(steps, 5)
         np.testing.assert_array_equal(toks[-3:], [S3GEN_SIL] * 3)
         # Same audio as one final-mode vocode of the tokens + 3 silence tokens.
-        ids = tts.t3._ids(mx.zeros((2, len(LONG_SENTENCE.split()) + 2)), 10**6, 2)
+        mx.random.seed(2)
+        ids = tts.t3._ids(mx.zeros((2, len(LONG_SENTENCE.split()) + 2)), 10**6)
         ids = np.concatenate([ids[ids < 6561], [S3GEN_SIL] * 3])
         ref = _np(tts._vocoder_host()._vocode(ids, 5, 2, finalize=True))
         np.testing.assert_allclose(np.concatenate(pieces), ref, atol=1e-6)
@@ -453,7 +456,9 @@ class TestStream(_Base):
         tts = _tts("meanflow", t3=_StreamingT3Stub())
 
         def run(seed):
-            return np.concatenate(list(tts.generate_stream(THREE_SENTENCES, "en", seed=seed)))
+            return np.concatenate(
+                list(tts.generate_stream(THREE_SENTENCES, "en", seed=seed))
+            )
 
         a, b, c = run(5), run(5), run(6)
         np.testing.assert_array_equal(a, b)
@@ -476,7 +481,9 @@ class TestStream(_Base):
                 next(tts.generate_stream("again", "en"))
             # ... and another thread waits for the lock.
             got = []
-            th = threading.Thread(target=lambda: got.append(tts._lock.acquire(timeout=0.2)))
+            th = threading.Thread(
+                target=lambda: got.append(tts._lock.acquire(timeout=0.2))
+            )
             th.start()
             th.join()
             self.assertEqual(got, [False])
@@ -498,8 +505,13 @@ class TestStream(_Base):
             th.start()
             th.join()
             self.assertEqual(got, [True])
-            self.assertGreater(len(_np(tts.generate("Hello again my friend.", "en", seed=1))), 0)
-            self.assertGreater(len(list(tts.generate_stream("Hello again my friend.", "en", seed=1))), 0)
+            self.assertGreater(
+                len(_np(tts.generate("Hello again my friend.", "en", seed=1))), 0
+            )
+            self.assertGreater(
+                len(list(tts.generate_stream("Hello again my friend.", "en", seed=1))),
+                0,
+            )
 
     def test_no_watermark(self):
         tts = _tts("meanflow")
@@ -519,6 +531,28 @@ class TestStream(_Base):
         with self.assertRaises(ValueError):
             list(tts.generate_stream("hi", "xx"))
         self.assertEqual(tts._stream_active, 0)
+
+
+class TestT3Contract(unittest.TestCase):
+    def test_real_t3_accepts_the_stream_and_precision_calls(self):
+        from chatterbox.models.t3_mlx.t3_mlx import T3MLX
+
+        gen = inspect.signature(T3MLX.generate_tokens).parameters
+        for name in (
+            "t3_cond",
+            "text_tokens",
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "min_p",
+            "repetition_penalty",
+            "cfg_weight",
+            "show_progress",
+        ):
+            self.assertIn(name, gen)
+        fin = inspect.signature(T3MLX.finalize).parameters
+        self.assertIn("dtype", fin)
+        self.assertIn("quantize_bits", fin)
 
 
 class TestSharedModule(unittest.TestCase):

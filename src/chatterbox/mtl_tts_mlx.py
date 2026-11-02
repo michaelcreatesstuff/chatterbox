@@ -180,15 +180,14 @@ def load_mlx_vocoder(weights_path: Union[str, Path], meanflow: bool):
 
 
 def apply_t3_precision(
-    t3: T3MLX, t3_dtype: str = "fp32", quantize_bits: Optional[int] = None
+    t3: T3MLX, t3_dtype: str = "float32", quantize_bits: Optional[int] = None
 ) -> T3MLX:
     """Cast T3 to ``t3_dtype`` and optionally quantize it (4 or 8 bits, group 64).
 
-    ``"fp32"`` without quantization leaves T3 untouched (the 1.2.0 model).
-    When T3 has ``finalize(dtype, quantize_bits=...)`` (the fast decode loop),
-    that does the work; otherwise the weights are cast with ``set_dtype`` and
-    the transformer linears quantized with ``mlx.nn.quantize``. On the 1.2.0
-    decode loop fp16 is slower than fp32; use it with the fast loop.
+    ``"float32"`` without quantization leaves T3 untouched (the 1.2.0
+    weights). Otherwise ``T3MLX.finalize(dtype=..., quantize_bits=...)`` does
+    the work; a T3 without ``finalize`` is cast with ``set_dtype`` and its
+    transformer quantized with ``mlx.nn.quantize``.
     """
     if t3_dtype not in T3_DTYPES:
         raise ValueError(f"t3_dtype must be one of {list(T3_DTYPES)}, got {t3_dtype!r}")
@@ -199,7 +198,7 @@ def apply_t3_precision(
         return t3
     finalize = getattr(t3, "finalize", None)
     if callable(finalize):
-        finalize(dtype, quantize_bits=quantize_bits)
+        finalize(dtype=dtype, quantize_bits=quantize_bits)
     else:
         import mlx.nn as nn
 
@@ -564,7 +563,7 @@ class ChatterboxMultilingualTTSMLX:
         *,
         vocoder: str = "pt",
         meanflow_path: Optional[Union[str, Path]] = None,
-        t3_dtype: str = "fp32",
+        t3_dtype: str = "float32",
         quantize_bits: Optional[int] = None,
         mlx_cache_limit_gb: float = 2.0,
     ) -> "ChatterboxMultilingualTTSMLX":
@@ -637,7 +636,7 @@ class ChatterboxMultilingualTTSMLX:
         *,
         vocoder: str = "pt",
         meanflow_path: Optional[Union[str, Path]] = None,
-        t3_dtype: str = "fp32",
+        t3_dtype: str = "float32",
         quantize_bits: Optional[int] = None,
         mlx_cache_limit_gb: float = 2.0,
     ) -> "ChatterboxMultilingualTTSMLX":
@@ -662,7 +661,9 @@ class ChatterboxMultilingualTTSMLX:
                 snapshot). Only for ``vocoder="meanflow"``; ``None`` looks in
                 ``ckpt_dir``. Nothing is downloaded (see
                 :func:`resolve_meanflow_path`).
-            t3_dtype: ``"fp32"`` (default) or ``"fp16"`` T3 weights.
+            t3_dtype: ``"float32"`` (default) or ``"float16"`` T3 weights
+                (``"fp32"`` / ``"fp16"`` also accepted). fp16 roughly halves
+                the T3 time per token on the fast decode loop.
             quantize_bits: ``None`` (default), 8 or 4: weight-only quantization
                 of T3 (group size 64). Off by default: q8 is not yet
                 validated on every language.
@@ -724,7 +725,7 @@ class ChatterboxMultilingualTTSMLX:
         t3.load_weights(list(mlx_state.items()), strict=False)
         t3.eval()  # Set to eval mode to disable dropout
         logger.info("✓ T3 multilingual weights loaded successfully")
-        if t3_dtype != "fp32" or quantize_bits is not None:
+        if T3_DTYPES[t3_dtype] != "float32" or quantize_bits is not None:
             logger.info(
                 f"T3 precision: dtype={t3_dtype}, quantize_bits={quantize_bits}"
             )
@@ -1366,28 +1367,48 @@ class ChatterboxMultilingualTTSMLX:
             yield y
 
     def _t3_token_blocks(
-        self, *, block_tokens: int = STREAM_BLOCK_TOKENS, **t3_kwargs
+        self, *, block_tokens: int = STREAM_BLOCK_TOKENS, seed=None, **t3_kwargs
     ) -> Iterator[np.ndarray]:
-        """T3 speech ids of one chunk, in blocks, while T3 decodes.
+        """T3 speech ids of one chunk, in blocks of ``block_tokens``, while T3 decodes.
 
-        Uses ``self.t3.generate_stream(**t3_kwargs, block_tokens=...)`` when T3
-        has it (the fast decode loop). Otherwise T3 decodes the whole chunk
-        with ``inference`` first, and its ids are cut into blocks (same ids,
-        no early audio).
+        Uses ``T3MLX.generate_tokens`` (the fast decode loop). It samples from
+        MLX's global RNG, which :meth:`_prepare_t3_inputs` seeded. A T3
+        without it decodes the whole chunk with ``inference`` first; its ids
+        are then cut into blocks (same ids, no early audio).
+
+        Between blocks the window vocoder re-seeds MLX's RNG for its own
+        noise. So with windows, T3 samples after the first window differ
+        from :meth:`generate` with the same seed; they stay deterministic
+        for a given seed.
         """
-        stream = getattr(self.t3, "generate_stream", None)
-        if callable(stream):
-            return stream(**t3_kwargs, block_tokens=block_tokens)
-        return self._t3_blocks_after_decode(block_tokens, t3_kwargs)
+        block_tokens = max(1, int(block_tokens))
+        gen_tokens = getattr(self.t3, "generate_tokens", None)
+        if not callable(gen_tokens):
+            yield from self._t3_blocks_after_decode(block_tokens, seed, t3_kwargs)
+            return
+        tokens = gen_tokens(**t3_kwargs, show_progress=False)
+        try:
+            block = []
+            for tok in tokens:
+                block.append(int(tok))
+                if len(block) >= block_tokens:
+                    yield np.asarray(block, dtype=np.int64)
+                    block = []
+            if block:
+                yield np.asarray(block, dtype=np.int64)
+        finally:
+            close = getattr(tokens, "close", None)
+            if close is not None:
+                close()
 
     def _t3_blocks_after_decode(
-        self, block_tokens: int, t3_kwargs: dict
+        self, block_tokens: int, seed, t3_kwargs: dict
     ) -> Iterator[np.ndarray]:
         with torch.inference_mode():
-            toks = self.t3.inference(**t3_kwargs, show_progress=False)
+            toks = self.t3.inference(**t3_kwargs, seed=seed, show_progress=False)
         ids = np.array(toks[0] if len(toks.shape) > 1 else toks)
         ids = ids.reshape(-1).astype(np.int64)
-        for i in range(0, len(ids), max(1, int(block_tokens))):
+        for i in range(0, len(ids), block_tokens):
             yield ids[i : i + block_tokens]
 
     def _generate_single(
