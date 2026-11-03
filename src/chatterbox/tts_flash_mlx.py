@@ -13,7 +13,9 @@ Chatterbox-Flash TTS pipeline with the block-diffusion T3 on MLX.
 Parity notes vs. upstream ``chatterbox_flash.tts.ChatterboxFlashTTS``: same text
 normalization (``en_us_cleaner``), token budget (``max(6 * n_text_tokens,
 300)``), conditioning and EOS trimming when ``split_sentences=False``. Upstream
-Flash does not watermark its output, so neither does this pipeline.
+Flash does not watermark its output, so by default neither does this
+pipeline; ``generate(watermark=True)`` applies the Perth watermark once, to
+the final waveform (as Turbo).
 
 With ``split_sentences=True`` (the default) long text is cut into sentence
 groups of at most :data:`MAX_CHUNK_WORDS` words, each group gets a speech-token
@@ -62,6 +64,7 @@ from .models.t3_flash_mlx import T3FlashMLX, en_us_cleaner, trim_speech_tokens
 from .models.t3_mlx.modules.cond_enc_mlx import T3CondMLX
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
+from .watermarking import PerthWatermarkMixin
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +209,7 @@ def _require_meanflow(cls, where: str):
         )
 
 
-class ChatterboxFlashMLX:
+class ChatterboxFlashMLX(PerthWatermarkMixin):
     """Chatterbox-Flash text-to-speech with the T3 decoder on MLX."""
 
     ENC_COND_LEN = 6 * S3_SR
@@ -622,13 +625,15 @@ class ChatterboxFlashMLX:
         overlap_duration: float = 0.05,
         language: str = "en",
         max_batch_chunks: int = 4,
+        watermark: bool = False,
     ) -> np.ndarray:
         """Synthesize ``text``; returns a 1-D float32 waveform at :attr:`sr`.
 
         Decoding defaults are the paper / upstream ``tts.generate`` defaults.
         Timings and decoder statistics land in :attr:`last_timings` (summed
-        over chunks, plus ``n_chunks`` and ``batch_rounds``: the number of
-        T3 block rounds, which is the block count when chunks run one by one).
+        over chunks, plus ``n_chunks``, ``watermark_s`` and ``batch_rounds``:
+        the number of T3 block rounds, which is the block count when chunks
+        run one by one).
 
         Args:
             time_shift_tau: Early-decoding strength; the model card calls it
@@ -651,6 +656,9 @@ class ChatterboxFlashMLX:
                 cut short by ``max_speech_tokens`` or the upstream budget
                 (its noise is drawn at full block shape). ``fuse_commit``
                 applies to one-by-one decoding only.
+            watermark: Apply the Perth watermark to the final waveform.
+                Default ``False``: upstream Flash does not watermark. The
+                watermarker is built on the first call that needs it.
         """
         if self._t3_cond_emb is None:
             raise ValueError("Call prepare_conditionals() first.")
@@ -743,6 +751,13 @@ class ChatterboxFlashMLX:
             wav = out.numpy() if hasattr(out, "numpy") else np.asarray(out)
         else:
             wav = nonempty[0] if nonempty else np.zeros((0,), dtype=np.float32)
+        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+
+        watermark_s = 0.0
+        if watermark and len(wav):
+            t_wm = time.perf_counter()
+            wav = self._watermark(wav)
+            watermark_s = time.perf_counter() - t_wm
 
         steps = [s for t in chunks_t for s in t["steps_per_block"]]
         self.last_timings = {
@@ -755,5 +770,6 @@ class ChatterboxFlashMLX:
             "batch_rounds": sum(t["batch_rounds"] for t in chunks_t),
             "avg_steps_per_block": float(np.mean(steps)) if steps else 0.0,
             "n_chunks": len(chunks_t),
+            "watermark_s": watermark_s,
         }
-        return np.asarray(wav, dtype=np.float32).reshape(-1)
+        return wav

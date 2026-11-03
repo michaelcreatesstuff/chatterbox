@@ -227,7 +227,7 @@ Known limits:
 - Keep `cfg_scale=1.0`. Without guidance, long text loops and the pitch drifts.
 - With some voices, Flash adds a few babbled words after the end of a short text (WER 0.23 on medium text with one of three test voices).
 - 4-bit quantization breaks long text. Do not use it with Flash.
-- Flash output has no watermark, the same as upstream Flash.
+- By default, Flash output has no watermark, the same as upstream Flash. Set `watermark=True` in `generate()` to add a Perth watermark.
 
 ## 🙏 Acknowledgements
 
@@ -440,6 +440,8 @@ wav = model.generate("Bonjour, comment ça va?", language_id="fr")
 # Japanese
 wav = model.generate("こんにちは、元気ですか？", language_id="ja")
 ```
+
+By default, multilingual output has no watermark, the same as upstream. Set `watermark=True` in `generate()`, `generate_long()` or `generate_stream()` to add a Perth watermark. The stream watermarks each piece and keeps the piece lengths. The watermarker loads on first use, so it costs nothing when it is off.
 
 ---
 
