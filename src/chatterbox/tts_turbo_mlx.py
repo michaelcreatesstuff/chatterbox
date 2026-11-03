@@ -73,6 +73,11 @@ from .models.t3_mlx.modules.cond_enc_mlx import T3CondMLX
 from .models.t3_turbo_mlx import T3TurboMLX
 from .models.t3_turbo_mlx.t3_turbo_mlx import MAX_GEN_LEN
 from .models.voice_encoder import VoiceEncoder
+from .watermarking import (  # noqa: F401  (WATERMARK_CONTEXT_S re-exported)
+    WATERMARK_CONTEXT_S,
+    PerthWatermarkMixin,
+    StreamWatermark,
+)
 from .streaming_mlx import (  # noqa: F401  (moved there; re-exported here)
     S3GEN_PRE_LOOKAHEAD,
     S3GEN_SIL,
@@ -116,9 +121,6 @@ ALLOW_PATTERNS = [
 TEXT_VOCAB = 50276
 
 DEFAULT_MAX_BATCH_CHUNKS = 8
-
-# Already-watermarked audio fed back as left context to the next piece.
-WATERMARK_CONTEXT_S = 0.25
 
 # Per-chunk decode cap with split_sentences: 1.5x the Flash budget estimate
 # (12.5 tokens per word + 25) plus 25 tokens. Over 272 chunks with 4 real
@@ -198,7 +200,7 @@ def postprocess_speech_tokens(tokens: np.ndarray) -> np.ndarray:
     return np.concatenate([tokens, np.full(3, S3GEN_SIL, dtype=np.int64)])
 
 
-class ChatterboxTurboMLX:
+class ChatterboxTurboMLX(PerthWatermarkMixin):
     """Chatterbox-Turbo (or Nano) text-to-speech with the T3 decoder on MLX."""
 
     ENC_COND_LEN = 15 * S3_SR
@@ -524,17 +526,6 @@ class ChatterboxTurboMLX:
                 self.model_label,
             )
 
-    def _watermark(self, wav: np.ndarray) -> np.ndarray:
-        # Perth runs torch ops; with autograd on it leaves tensors with a
-        # grad_fn behind on every call.
-        with TORCH_LOCK, torch.inference_mode():
-            if self._watermarker is None:
-                import perth
-
-                self._watermarker = perth.PerthImplicitWatermarker()
-            out = self._watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return np.asarray(out, dtype=np.float32).reshape(-1)
-
     def _groups(self, n: int, max_batch: int) -> List[range]:
         """Consecutive equal-size chunk groups of at most ``max_batch`` chunks."""
         n_groups = math.ceil(n / max_batch)
@@ -768,8 +759,7 @@ class ChatterboxTurboMLX:
                 repetition_penalty=repetition_penalty,
             )
             joiner = _ChunkJoiner(len(pieces), self.sr, overlap_duration)
-            wm_ctx = np.zeros((0,), dtype=np.float32)
-            wm_ctx_len = int(WATERMARK_CONTEXT_S * self.sr)
+            stream_wm = StreamWatermark(self._watermark, self.sr)
             t = {
                 "t3_s": 0.0,
                 "s3gen_s": 0.0,
@@ -785,19 +775,13 @@ class ChatterboxTurboMLX:
             }
 
             def out(wav: np.ndarray, last: bool) -> np.ndarray:
-                nonlocal wm_ctx
                 y = joiner.push(wav)
                 if last:
                     y = np.concatenate([y, joiner.finish()])
                 if watermark and len(y):
                     t0 = time.perf_counter()
                     # Perth sees the previous (unwatermarked) audio as context.
-                    x = np.concatenate([wm_ctx, y])
-                    w = self._watermark(x)[len(wm_ctx) :]
-                    if len(w) < len(y):
-                        w = np.concatenate([w, y[len(w) :]])
-                    wm_ctx = x[-wm_ctx_len:]
-                    y = w[: len(y)].astype(np.float32, copy=False)
+                    y = stream_wm(y)
                     t["watermark_s"] += time.perf_counter() - t0
                 if len(y):
                     t["n_pieces"] += 1

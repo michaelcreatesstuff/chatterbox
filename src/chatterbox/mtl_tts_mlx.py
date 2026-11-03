@@ -104,8 +104,9 @@ from .streaming_mlx import (
     ref_dict_to_mlx,
 )
 
-import perth
 import librosa
+
+from .watermarking import PerthWatermarkMixin, StreamWatermark
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +467,7 @@ class Conditionals:
         return cls(T3Cond(**kwargs["t3"]), kwargs["gen"])
 
 
-class ChatterboxMultilingualTTSMLX:
+class ChatterboxMultilingualTTSMLX(PerthWatermarkMixin):
     """
     MLX-optimized Multilingual Chatterbox TTS pipeline.
 
@@ -522,12 +523,15 @@ class ChatterboxMultilingualTTSMLX:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        # NOTE (watermark): the Perth watermarker is built here but, as in
-        # every release up to 1.2.0, generate(), generate_long() and
-        # generate_stream() never apply it -- the audio is NOT watermarked.
-        # This is kept on purpose (no behaviour change) until the owner
-        # decides; Turbo applies it per piece (see ChatterboxTurboMLX).
-        self.watermarker = perth.PerthImplicitWatermarker()
+        # NOTE (watermark): generate(), generate_long() and generate_stream()
+        # take ``watermark`` (default False). The default keeps the output of
+        # every release up to 1.3.0 and of upstream mtl_tts.py, which builds
+        # a watermarker but never applies it. With ``watermark=True`` the
+        # Perth watermark is applied as Turbo does: once to the whole output,
+        # or per stream piece with the previous audio as left context. The
+        # watermarker (``self.watermarker``) is built on first use, not here,
+        # so an engine that never watermarks pays no load time or memory.
+        self._watermarker = None
 
         self.vocoder = _check_vocoder(vocoder)
         if vocoder != "pt":
@@ -919,6 +923,7 @@ class ChatterboxMultilingualTTSMLX:
         show_progress: bool = True,
         seed: Optional[int] = None,
         n_cfm_timesteps: Optional[int] = None,
+        watermark: bool = False,
     ) -> torch.Tensor:
         """
         Generate speech from text using hybrid MLX/PyTorch pipeline.
@@ -942,9 +947,14 @@ class ChatterboxMultilingualTTSMLX:
                   for reproducible results.
             n_cfm_timesteps: S3Gen CFM steps; None (default) uses the
                   vocoder's default (5, or 2 for ``"meanflow"``).
+            watermark: Apply the Perth watermark once, to the final waveform
+                  (as Turbo). Default False: upstream does not apply it.
 
         Returns:
             Generated audio waveform as torch tensor
+
+        :attr:`last_timings` is set: ``wall_s`` (generation),
+        ``watermark_s`` and ``n_chunks``.
         """
         import time as _time
 
@@ -1029,7 +1039,7 @@ class ChatterboxMultilingualTTSMLX:
             self.last_generation_time = gen_time
 
             clear_device_memory()
-            return result
+            return self._finish_generate(result, watermark, gen_time, 1)
 
         # Multiple sentences - generate each and crossfade
         audio_chunks = []
@@ -1094,11 +1104,33 @@ class ChatterboxMultilingualTTSMLX:
 
         clear_device_memory()
 
-        return (
-            torch.from_numpy(result_np).unsqueeze(0)
-            if isinstance(result_np, np.ndarray)
-            else result.unsqueeze(0)
+        return self._finish_generate(
+            (
+                torch.from_numpy(result_np).unsqueeze(0)
+                if isinstance(result_np, np.ndarray)
+                else result.unsqueeze(0)
+            ),
+            watermark,
+            total_time,
+            num_chunks,
         )
+
+    def _finish_generate(
+        self, wav: torch.Tensor, watermark: bool, wall_s: float, n_chunks: int
+    ) -> torch.Tensor:
+        """Watermark ``generate``'s ``(1, N)`` output if asked; set :attr:`last_timings`."""
+        watermark_s = 0.0
+        if watermark and wav.shape[-1]:
+            t0 = time.perf_counter()
+            marked = self._watermark(wav.detach().cpu().numpy().reshape(-1))
+            wav = torch.from_numpy(marked).unsqueeze(0).to(wav.dtype)
+            watermark_s = time.perf_counter() - t0
+        self.last_timings = {
+            "wall_s": wall_s,
+            "watermark_s": watermark_s,
+            "n_chunks": n_chunks,
+        }
+        return wav
 
     def _set_exaggeration(self, exaggeration: float) -> None:
         """Rebuild ``conds.t3`` when ``exaggeration`` differs from its emotion value."""
@@ -1149,6 +1181,7 @@ class ChatterboxMultilingualTTSMLX:
         chunk_tokens: int = MTL_STREAM_CHUNK_TOKENS,
         context_tokens: int = STREAM_CONTEXT_TOKENS,
         lookahead_tokens: int = STREAM_LOOKAHEAD_TOKENS,
+        watermark: bool = False,
     ) -> Iterator[np.ndarray]:
         """Synthesize ``text`` and yield 1-D float32 pieces at :attr:`sr` as they are ready.
 
@@ -1181,8 +1214,10 @@ class ChatterboxMultilingualTTSMLX:
         (``T3MLX.generate_stream``). Without one, each chunk's tokens are
         decoded first and then fed to the windows (same audio, later).
 
-        Watermark: no watermark is applied, as in :meth:`generate` (see the
-        note in :meth:`__init__`).
+        ``watermark`` (default False, as :meth:`generate`) applies the Perth
+        watermark to each piece, with the end of the previous unwatermarked
+        audio as left context (as Turbo's ``generate_stream``). The pieces
+        keep their count and lengths.
 
         The generator holds the instance lock until it is exhausted or
         closed: other threads wait, and calling :meth:`generate`,
@@ -1192,8 +1227,9 @@ class ChatterboxMultilingualTTSMLX:
 
         :attr:`last_timings` is set when the generator ends: ``t3_s`` and
         ``s3gen_s`` (windowed chunks), ``wall_s``, ``first_audio_s`` (call to
-        first piece), ``n_speech_tokens`` (windowed chunks), ``n_chunks``,
-        ``n_pieces``, ``n_windows`` (S3Gen window calls) and ``vocoder``.
+        first piece), ``watermark_s``, ``n_speech_tokens`` (windowed chunks),
+        ``n_chunks``, ``n_pieces``, ``n_windows`` (S3Gen window calls) and
+        ``vocoder``.
         """
         with self._lock:
             self._check_no_stream()
@@ -1227,11 +1263,13 @@ class ChatterboxMultilingualTTSMLX:
             )
             n = len(sentences)
             joiner = _ChunkJoiner(n, self.sr, overlap_duration)
+            stream_wm = StreamWatermark(self._watermark, self.sr)
             t = {
                 "t3_s": 0.0,
                 "s3gen_s": 0.0,
                 "wall_s": 0.0,
                 "first_audio_s": None,
+                "watermark_s": 0.0,
                 "n_speech_tokens": 0,
                 "n_chunks": n,
                 "n_pieces": 0,
@@ -1243,7 +1281,11 @@ class ChatterboxMultilingualTTSMLX:
                 y = joiner.push(wav)
                 if last:
                     y = np.concatenate([y, joiner.finish()])
-                # Watermark: intentionally not applied (see __init__).
+                if watermark and len(y):
+                    t0 = time.perf_counter()
+                    # Perth sees the previous (unwatermarked) audio as context.
+                    y = stream_wm(y)
+                    t["watermark_s"] += time.perf_counter() - t0
                 if len(y):
                     t["n_pieces"] += 1
                     if t["first_audio_s"] is None:
@@ -1704,6 +1746,7 @@ class ChatterboxMultilingualTTSMLX:
         show_progress: bool = False,
         seed: Optional[int] = None,
         n_cfm_timesteps: Optional[int] = None,
+        watermark: bool = False,
     ) -> torch.Tensor:
         """
         Generate long-form speech with adaptive chunking strategy.
@@ -1727,6 +1770,8 @@ class ChatterboxMultilingualTTSMLX:
             progress_callback: Optional callback function for progress monitoring
             seed: Random seed for deterministic generation
             n_cfm_timesteps: S3Gen CFM steps (None: the vocoder's default)
+            watermark: Apply the Perth watermark once, to the final waveform.
+                Default False, as :meth:`generate`.
 
         Returns:
             torch.Tensor: Generated audio waveform with shape (1, num_samples)
@@ -1876,6 +1921,17 @@ class ChatterboxMultilingualTTSMLX:
         # Store generation time for external use (e.g., benchmarking)
         self.last_generation_time = total_time
 
+        wav = self._finish_generate(
+            (
+                torch.from_numpy(result_np).unsqueeze(0)
+                if isinstance(result_np, np.ndarray)
+                else result.unsqueeze(0)
+            ),
+            watermark,
+            total_time,
+            num_chunks,
+        )
+
         if progress_callback:
             progress_callback(
                 stage="complete",
@@ -1883,8 +1939,4 @@ class ChatterboxMultilingualTTSMLX:
                 final_audio_shape=(1, len(result_np)),
             )
 
-        return (
-            torch.from_numpy(result_np).unsqueeze(0)
-            if isinstance(result_np, np.ndarray)
-            else result.unsqueeze(0)
-        )
+        return wav

@@ -526,11 +526,16 @@ class TestStream(_Base):
             )
 
     def test_no_watermark(self):
+        # Off by default; the watermarker is not even built (see
+        # test_watermark_option.py for watermark=True).
         tts = _tts("meanflow")
-        with mock.patch.object(tts.watermarker, "apply_watermark") as wm:
+        with mock.patch(
+            "chatterbox.watermarking.build_perth_watermarker"
+        ) as build:
             list(tts.generate_stream(THREE_SENTENCES, "en", seed=1))
             tts.generate(THREE_SENTENCES, "en", seed=1)
-        wm.assert_not_called()
+        build.assert_not_called()
+        self.assertFalse(tts.watermarker_loaded)
 
     def test_empty_and_bad_args(self):
         tts = _tts("meanflow")
