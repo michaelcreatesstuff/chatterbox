@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 from scipy.io import wavfile
 
+from chatterbox.generation_utils import format_speed, real_time_factor
+
 
 # Benchmark test texts for different languages
 BENCHMARK_TEXTS = {
@@ -65,6 +67,8 @@ def run_benchmark(
     voice=None,
     exaggeration=0.5,
     cfg_weight=0.5,
+    vocoder="meanflow",
+    t3_dtype="fp16",
 ):
     """Run a quick multilingual benchmark."""
 
@@ -75,6 +79,8 @@ def run_benchmark(
     print("🎯 CHATTERBOX MLX BENCHMARK")
     print("=" * 60)
     print(f"   Backend: {backend}")
+    if backend in ("hybrid-mlx", "mlx"):
+        print(f"   Vocoder: {vocoder} | T3 dtype: {t3_dtype}")
     print(f"   Languages: {', '.join(languages)}")
     if voice:
         print(f"   Voice: {voice}")
@@ -88,7 +94,9 @@ def run_benchmark(
     if backend in ("hybrid-mlx", "mlx"):
         from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
 
-        model = ChatterboxMultilingualTTSMLX.from_pretrained()
+        model = ChatterboxMultilingualTTSMLX.from_pretrained(
+            vocoder=vocoder, t3_dtype=t3_dtype
+        )
     else:
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
@@ -140,7 +148,7 @@ def run_benchmark(
             gen_time = time.time() - gen_start
 
         duration = wav.shape[-1] / model.sr
-        rtf = duration / gen_time
+        rtf = real_time_factor(gen_time, duration)
 
         total_gen_time += gen_time
         total_duration += duration
@@ -156,7 +164,8 @@ def run_benchmark(
         )
 
         print(
-            f"       → {gen_time:.2f}s generation, {duration:.1f}s audio, RTF: {rtf:.2f}x"
+            f"       → {gen_time:.2f}s generation, {duration:.1f}s audio, "
+            f"{format_speed(gen_time, duration)}"
         )
 
         if save_audio_flag:
@@ -167,22 +176,25 @@ def run_benchmark(
     print()
 
     # Summary
-    avg_rtf = total_duration / total_gen_time if total_gen_time > 0 else 0
+    avg_rtf = real_time_factor(total_gen_time, total_duration)
 
     print("=" * 60)
     print("📊 BENCHMARK RESULTS")
     print("=" * 60)
     print(f"{'Language':<12} {'Gen Time':>10} {'Duration':>10} {'RTF':>8}")
+    print(
+        "   RTF = generation time / audio duration. Below 1.0 is faster than real time."
+    )
     print("-" * 60)
 
     for r in results:
         print(
-            f"{r['name']:<12} {r['gen_time']:>9.2f}s {r['duration']:>9.1f}s {r['rtf']:>7.2f}x"
+            f"{r['name']:<12} {r['gen_time']:>9.2f}s {r['duration']:>9.1f}s {r['rtf']:>8.2f}"
         )
 
     print("-" * 60)
     print(
-        f"{'TOTAL':<12} {total_gen_time:>9.2f}s {total_duration:>9.1f}s {avg_rtf:>7.2f}x"
+        f"{'TOTAL':<12} {total_gen_time:>9.2f}s {total_duration:>9.1f}s {avg_rtf:>8.2f}"
     )
     print("=" * 60)
 
@@ -243,7 +255,13 @@ def generate_output_filename(text: str, lang: str) -> str:
     slug = slug[:30]  # Limit length
     if not slug:
         slug = f"output_{int(time.time())}"
-    return f"{slug}_{lang}.wav"
+    # Never overwrite an earlier output: add _2, _3, ... when the name exists.
+    candidate = Path(f"{slug}_{lang}.wav")
+    index = 2
+    while candidate.exists():
+        candidate = Path(f"{slug}_{lang}_{index}.wav")
+        index += 1
+    return str(candidate)
 
 
 def main():
@@ -258,7 +276,8 @@ Examples:
   chatterbox "Bonjour!" --lang fr -o french.wav
   chatterbox "Hello" --voice reference.wav --exaggeration 0.7
   chatterbox --benchmark
-  chatterbox --benchmark --languages en es ja --save-audio
+  chatterbox --benchmark --languages en es ja --no-save-audio
+  chatterbox "Hello" --vocoder pt --t3-dtype float32   # the 1.2.0 model
 
 Supported Languages:
   en (English), es (Spanish), fr (French), de (German), it (Italian),
@@ -317,6 +336,19 @@ Supported Languages:
         help="Backend to use (default: hybrid-mlx)",
     )
     parser.add_argument(
+        "--vocoder",
+        choices=["meanflow", "mlx", "pt"],
+        default="meanflow",
+        help="S3Gen vocoder for the MLX backends (default: meanflow, 2 steps, fastest). "
+        "'mlx' and 'pt' run the original 5-step vocoder on MLX or PyTorch.",
+    )
+    parser.add_argument(
+        "--t3-dtype",
+        choices=["fp16", "float32"],
+        default="fp16",
+        help="T3 decoder precision for the MLX backends (default: fp16, fastest)",
+    )
+    parser.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress messages"
     )
     parser.add_argument(
@@ -347,6 +379,8 @@ Supported Languages:
             voice=args.voice,
             exaggeration=args.exaggeration,
             cfg_weight=args.cfg,
+            vocoder=args.vocoder,
+            t3_dtype=args.t3_dtype,
         )
 
     # Regular TTS mode - text is required
@@ -364,6 +398,8 @@ Supported Languages:
         print(f'   Text: "{args.text}"')
         print(f"   Language: {args.lang}")
         print(f"   Backend: {args.backend}")
+        if args.backend in ("hybrid-mlx", "mlx"):
+            print(f"   Vocoder: {args.vocoder} | T3 dtype: {args.t3_dtype}")
         print(f"   Output: {output_path}")
         print()
 
@@ -388,7 +424,9 @@ Supported Languages:
             # MLX models don't take a device parameter - they auto-detect
             from chatterbox.mtl_tts_mlx import ChatterboxMultilingualTTSMLX
 
-            model = ChatterboxMultilingualTTSMLX.from_pretrained()
+            model = ChatterboxMultilingualTTSMLX.from_pretrained(
+                vocoder=args.vocoder, t3_dtype=args.t3_dtype
+            )
         else:  # pytorch
             if args.lang != "en":
                 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
@@ -435,10 +473,10 @@ Supported Languages:
 
         if not args.quiet:
             duration = wav.shape[-1] / model.sr
-            rtf = duration / gen_time
             print(f"✅ Saved to {output_path}")
             print(
-                f"   Duration: {duration:.1f}s | Generated in {gen_time:.1f}s | RTF: {rtf:.2f}x"
+                f"   Duration: {duration:.1f}s | Generated in {gen_time:.1f}s | "
+                f"{format_speed(gen_time, duration)}"
             )
         else:
             print(output_path)
