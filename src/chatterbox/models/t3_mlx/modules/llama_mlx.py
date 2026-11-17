@@ -359,7 +359,6 @@ class Attention(nn.Module):
         # (k, v are in transposed format: B, n_heads, L, head_dim)
         return output, (k, v), attention_weights
 
-
     def fast_call(
         self,
         x: mx.array,
