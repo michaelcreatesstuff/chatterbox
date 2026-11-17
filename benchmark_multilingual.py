@@ -18,7 +18,6 @@ Designed for MacBook Pro M4 32GB.
 """
 
 import torch
-import torchaudio as ta
 import psutil
 import os
 import time
@@ -27,7 +26,7 @@ import statistics
 import numpy as np
 from scipy.io import wavfile
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 from pathlib import Path
 from chatterbox.models.utils import get_memory_info
 from benchmark_audio_quality import (
@@ -483,20 +482,20 @@ class MultilingualBenchmark:
 
         if is_hybrid_mlx:
             # Hybrid MLX: T3 MLX + S3Gen PyTorch
-            print(f"  Backend: Hybrid MLX (T3 MLX + S3Gen PyTorch)")
-            print(f"  T3: MLX (Apple Silicon optimized)")
-            print(f"  S3Gen: PyTorch on MPS")
+            print("  Backend: Hybrid MLX (T3 MLX + S3Gen PyTorch)")
+            print("  T3: MLX (Apple Silicon optimized)")
+            print("  S3Gen: PyTorch on MPS")
         elif is_mlx:
             # MLX models
-            print(f"  Backend: MLX (Apple Silicon optimized)")
+            print("  Backend: MLX (Apple Silicon optimized)")
             if device == "mlx-q4":
-                print(f"  Quantization: 4-bit (group_size=64)")
+                print("  Quantization: 4-bit (group_size=64)")
             else:
-                print(f"  Precision: Full (float32)")
+                print("  Precision: Full (float32)")
         else:
             # PyTorch models
-            print(f"  Backend: PyTorch")
-            print(f"  Float16 KV cache optimization: ENABLED")
+            print("  Backend: PyTorch")
+            print("  Float16 KV cache optimization: ENABLED")
 
             # Check device availability
             if device == "mps":
@@ -528,7 +527,7 @@ class MultilingualBenchmark:
                 self.model = ChatterboxMultilingualTTSMLX.from_pretrained()
                 log_memory_detailed("hybrid_mlx_model_loaded", device)
             except (ImportError, RuntimeError, AttributeError) as e:
-                print(f"\n⚠️  Hybrid MLX backend not available")
+                print("\n⚠️  Hybrid MLX backend not available")
                 print(f"    Error: {str(e)[:100]}")
                 raise RuntimeError(f"Hybrid MLX backend not available: {e}")
         elif is_mlx:
@@ -550,10 +549,10 @@ class MultilingualBenchmark:
                     log_memory_detailed("mlx_q4_after_quantize", device)
                     print("  ✓ Quantization complete")
             except (ImportError, RuntimeError, AttributeError) as e:
-                print(f"\n⚠️  MLX backend not fully implemented yet")
+                print("\n⚠️  MLX backend not fully implemented yet")
                 print(f"    Error: {str(e)[:100]}")
-                print(f"    Skipping MLX benchmarks...")
-                print(f"    Note: Currently only PyTorch backends (mps, cpu) are supported")
+                print("    Skipping MLX benchmarks...")
+                print("    Note: Currently only PyTorch backends (mps, cpu) are supported")
                 raise RuntimeError(f"MLX backend not available: {e}")
         else:
             # PyTorch backend
@@ -600,7 +599,6 @@ class MultilingualBenchmark:
         log_memory_detailed(f"gen_after_clear_run{run_id}", self.current_device)
 
         mem_before = get_memory_mb()
-        gpu_mem_before = get_gpu_memory_mb(self.current_device)
 
         start_time = time.time()
 
@@ -686,19 +684,19 @@ class MultilingualBenchmark:
 
         # Indicate which generation method will be used
         if category == "long":
-            print(f"  Method: generate_long() with chunking (50 words/chunk)")
+            print("  Method: generate_long() with chunking (50 words/chunk)")
         else:
-            print(f"  Method: generate() (single-pass)")
+            print("  Method: generate() (single-pass)")
 
         # Warmup runs
-        print(f"  Warmup runs: ", end="", flush=True)
+        print("  Warmup runs: ", end="", flush=True)
         for i in range(self.config.warmup_runs):
             self.run_single_generation(text, language_code, language_name, category=category, run_id=i)
             print(".", end="", flush=True)
         print(" done")
 
         # Benchmark runs
-        print(f"  Benchmark runs: ", end="", flush=True)
+        print("  Benchmark runs: ", end="", flush=True)
         run_results: List[MultilingualRunResult] = []
         for i in range(self.config.benchmark_runs):
             # Keep the waveform from the last timed run if we want to save audio
@@ -780,7 +778,7 @@ class MultilingualBenchmark:
 
                 # Comprehensive audio quality validation
                 if self.config.validate_transcription:
-                    print(f"  Validating audio quality...")
+                    print("  Validating audio quality...")
                     quality_metrics = validate_audio_quality(
                         audio_path=str(output_path),
                         reference_text=text,
@@ -806,7 +804,7 @@ class MultilingualBenchmark:
         print("\n" + "="*70)
         print("CHATTERBOX MULTILINGUAL TTS BENCHMARK")
         print("="*70)
-        print(f"Platform: macOS with Apple Silicon")
+        print("Platform: macOS with Apple Silicon")
         print(f"MPS Available: {torch.backends.mps.is_available()}")
         print(f"PyTorch Version: {torch.__version__}")
         print(f"Warmup Runs: {self.config.warmup_runs}")
@@ -817,10 +815,10 @@ class MultilingualBenchmark:
         if self.config.audio_prompt_path:
             print(f"Reference Audio: {self.config.audio_prompt_path}")
         if self.config.validate_transcription:
-            print(f"Transcription Validation: ENABLED (MLX Whisper)")
-        print(f"\n✓ Float16 KV Cache: ENABLED (default)")
-        print(f"  - Expected: 18-32% faster generation")
-        print(f"  - Expected: Significant memory savings")
+            print("Transcription Validation: ENABLED (MLX Whisper)")
+        print("\n✓ Float16 KV Cache: ENABLED (default)")
+        print("  - Expected: 18-32% faster generation")
+        print("  - Expected: Significant memory savings")
         print("="*70)
 
         for device in self.config.test_devices:
@@ -866,7 +864,6 @@ class MultilingualBenchmark:
 
         # Group results by device and category
         devices = list(set(r.device for r in self.results))
-        languages = sorted(set(r.language_code for r in self.results))
         categories = sorted(set(r.text_category for r in self.results))
 
         # Print separate table for each category

@@ -498,7 +498,9 @@ class T3MLX(nn.Module):
 
         # Prefill input: [cond | text | BOS] + BOS, as in the 1.2.0 loop
         bos_token = mx.array([[self.hp.start_speech_token]])
-        bos_embed = self.speech_emb(bos_token) + self.speech_pos_emb.get_fixed_embedding(0)
+        bos_embed = self.speech_emb(
+            bos_token
+        ) + self.speech_pos_emb.get_fixed_embedding(0)
         embeds, len_cond = self.prepare_input_embeds(
             t3_cond=t3_cond,
             text_tokens=text_tokens,
@@ -553,7 +555,9 @@ class T3MLX(nn.Module):
 
                 # Analyzer before the other logit processors (as in the 1.2.0 loop)
                 if analyzer is not None:
-                    last_token = generated_token_ids[-1] if generated_token_ids else None
+                    last_token = (
+                        generated_token_ids[-1] if generated_token_ids else None
+                    )
                     suppress, force = analyzer.step(
                         np.array(rows.astype(mx.float32)), next_token=last_token
                     )

@@ -2,7 +2,6 @@ import torch
 import torchaudio as ta
 import psutil
 import os
-from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 def get_memory_mb():

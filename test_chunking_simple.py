@@ -3,7 +3,6 @@ Simple test script for semantic chunking functionality.
 Tests the chunker without loading the full TTS pipeline.
 """
 
-import torch
 import os
 from dotenv import load_dotenv
 
