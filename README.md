@@ -66,7 +66,16 @@ Generate speech directly from the terminal:
 
     # Run multilingual benchmark (saves to benchmark_output/)
     chatterbox --benchmark --languages en es
+
+    # Use the original 1.2.0 model (5-step vocoder, fp32 T3), which is slower:
+    chatterbox "Hello" --vocoder pt --t3-dtype float32
 ```
+
+The CLI uses the multilingual model for every language. Since 1.3.3 it loads the fast options by default: the meanflow vocoder and the fp16 T3 decoder. The first run downloads `s3gen_meanflow.safetensors` from `ResembleAI/chatterbox-turbo`.
+
+The CLI prints speed as RTF: generation time divided by audio duration. An RTF below 1.0 is faster than real time.
+
+An auto-generated filename never overwrites an earlier file. The CLI adds `_2`, `_3` and so on.
 
 ### CLI Options
 
@@ -78,6 +87,9 @@ Generate speech directly from the terminal:
 | `--exaggeration`  | Emotion intensity (0.0-1.0)                  | `0.5`             |
 | `--cfg`           | Classifier-free guidance weight              | `0.5`             |
 | `--backend`       | Backend: hybrid-mlx, mlx, pytorch            | `hybrid-mlx`      |
+| `--vocoder`       | MLX vocoder: meanflow (2 steps), mlx, pt     | `meanflow`        |
+| `--t3-dtype`      | MLX T3 decoder precision: fp16, float32      | `fp16`            |
+| `--seed`          | Random seed for repeatable output            | None              |
 | `--benchmark`     | Run multilingual benchmark                   | False             |
 | `--languages`     | Languages to benchmark                       | en es fr de ja zh |
 | `--no-save-audio` | Don't save benchmark audio files             | False (saves)     |
@@ -461,19 +473,20 @@ By default, multilingual output has no watermark, the same as upstream. Set `wat
 
 ### Multilingual speed options
 
-Set these options at load time to make the multilingual model faster:
+Since 1.3.3, `from_pretrained()` loads the fast options by default. Set them at load time to change them:
 
 ```python
 model = ChatterboxMultilingualTTSMLX.from_pretrained(
     device="mps",
-    vocoder="meanflow",  # "pt" (default), "mlx" (MLX port, 5 steps) or "meanflow" (2 steps)
-    t3_dtype="fp16",     # "float32" (default), "fp16"
+    vocoder="meanflow",  # "meanflow" (default, 2 steps), "mlx" (MLX port, 5 steps) or "pt" (PyTorch, 5 steps)
+    t3_dtype="fp16",     # "fp16" (default) or "float32"
 )
 
 for piece in model.generate_stream("Bonjour, comment ça va?", language_id="fr"):
     ...  # play each 1-D float32 piece at model.sr, in order
 ```
 
+- To load the 1.2.0 model, pass `vocoder="pt", t3_dtype="float32"`. `from_local()` keeps those defaults, because it downloads nothing.
 - `vocoder="meanflow"` uses the Turbo meanflow S3Gen vocoder. Without `meanflow_path`, `from_pretrained()` downloads `s3gen_meanflow.safetensors` from `ResembleAI/chatterbox-turbo`.
 - `t3_dtype="fp16"` runs the T3 decoder in half precision. `quantize_bits` (`8` or `4`) also works. Listen to the output before you use quantization.
 - `generate_stream()` follows the same rules as the Turbo stream. Its default `chunk_tokens` is 40, not 50. With 50, playback gapped in some replies.

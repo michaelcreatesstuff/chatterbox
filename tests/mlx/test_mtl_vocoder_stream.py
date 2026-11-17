@@ -218,14 +218,21 @@ class _Base(unittest.TestCase):
 
 
 class TestDefaults(_Base):
-    def test_loader_defaults_are_1_2_0(self):
+    def test_loader_defaults(self):
         cls = M.ChatterboxMultilingualTTSMLX
-        for fn in (cls.from_local, cls.from_pretrained, cls.__init__):
+        # from_pretrained loads the fast pair since 1.3.3; it downloads the
+        # meanflow weights itself.
+        p = inspect.signature(cls.from_pretrained).parameters
+        self.assertEqual(p["vocoder"].default, "meanflow")
+        self.assertEqual(p["t3_dtype"].default, "fp16")
+        # from_local and __init__ download nothing, so they keep 1.2.0 defaults.
+        for fn in (cls.from_local, cls.__init__):
             p = inspect.signature(fn).parameters
             self.assertEqual(p["vocoder"].default, "pt")
+        p = inspect.signature(cls.from_local).parameters
+        self.assertEqual(p["t3_dtype"].default, "float32")
         for fn in (cls.from_local, cls.from_pretrained):
             p = inspect.signature(fn).parameters
-            self.assertEqual(p["t3_dtype"].default, "float32")
             self.assertIsNone(p["quantize_bits"].default)
             self.assertIsNone(p["meanflow_path"].default)
         # Positional order of the 1.2.0 arguments is unchanged.
@@ -529,9 +536,7 @@ class TestStream(_Base):
         # Off by default; the watermarker is not even built (see
         # test_watermark_option.py for watermark=True).
         tts = _tts("meanflow")
-        with mock.patch(
-            "chatterbox.watermarking.build_perth_watermarker"
-        ) as build:
+        with mock.patch("chatterbox.watermarking.build_perth_watermarker") as build:
             list(tts.generate_stream(THREE_SENTENCES, "en", seed=1))
             tts.generate(THREE_SENTENCES, "en", seed=1)
         build.assert_not_called()

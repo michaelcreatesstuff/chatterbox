@@ -636,6 +636,18 @@ def print_chunk_generating(
     )
 
 
+def real_time_factor(gen_time: float, audio_duration: float) -> float:
+    """RTF = generation time / audio duration. Below 1.0 is faster than real time."""
+    return gen_time / audio_duration if audio_duration > 0 else float("inf")
+
+
+def format_speed(gen_time: float, audio_duration: float) -> str:
+    """'RTF 0.33 (3.0x real time)': the RTF plus the speed it gives."""
+    rtf = real_time_factor(gen_time, audio_duration)
+    speed = audio_duration / gen_time if gen_time > 0 else float("inf")
+    return f"RTF {rtf:.2f} ({speed:.1f}x real time)"
+
+
 def print_chunk_completed(
     chunk_idx: int,
     total_chunks: int,
@@ -643,9 +655,8 @@ def print_chunk_completed(
     audio_duration: float,
 ) -> None:
     """Print status when a chunk is completed."""
-    realtime_factor = audio_duration / gen_time if gen_time > 0 else 0
     print(
-        f"  ✅ [{chunk_idx+1}/{total_chunks}] COMPLETED: {gen_time:.1f}s generation → {audio_duration:.1f}s audio ({realtime_factor:.2f}x realtime)"
+        f"  ✅ [{chunk_idx+1}/{total_chunks}] COMPLETED: {gen_time:.1f}s generation → {audio_duration:.1f}s audio ({format_speed(gen_time, audio_duration)})"
     )
 
 
@@ -656,13 +667,12 @@ def print_generation_complete(
     prefix: str = "",
 ) -> None:
     """Print final generation summary."""
-    realtime_factor = total_audio_duration / total_time if total_time > 0 else 0
     print(f"\n{'='*60}")
     print(f"✅ {prefix}GENERATION COMPLETE")
     print(f"{'='*60}")
     print(f"  Total generation time: {total_time:.1f}s")
     print(f"  Total audio duration:  {total_audio_duration:.1f}s")
-    print(f"  Overall realtime factor: {realtime_factor:.2f}x")
+    print(f"  Overall: {format_speed(total_time, total_audio_duration)}")
     if num_chunks > 1:
         print(f"  Chunks generated: {num_chunks}")
     print(f"{'='*60}\n")

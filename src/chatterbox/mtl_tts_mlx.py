@@ -572,9 +572,9 @@ class ChatterboxMultilingualTTSMLX(PerthWatermarkMixin):
         use_default_speaker: bool = True,
         device: str = "mps",
         *,
-        vocoder: str = "pt",
+        vocoder: str = "meanflow",
         meanflow_path: Optional[Union[str, Path]] = None,
-        t3_dtype: str = "float32",
+        t3_dtype: str = "fp16",
         quantize_bits: Optional[int] = None,
         mlx_cache_limit_gb: float = 2.0,
     ) -> "ChatterboxMultilingualTTSMLX":
@@ -587,7 +587,10 @@ class ChatterboxMultilingualTTSMLX(PerthWatermarkMixin):
             use_default_speaker: Whether to load default speaker conditioning
             device: PyTorch device for S3Gen ("mps" or "cpu")
             vocoder, meanflow_path, t3_dtype, quantize_bits, mlx_cache_limit_gb:
-                As :meth:`from_local`. With ``vocoder="meanflow"`` and no
+                As :meth:`from_local`, except the defaults: since 1.3.3 this
+                call loads the fast pair, ``vocoder="meanflow"`` and
+                ``t3_dtype="fp16"``. Pass ``vocoder="pt", t3_dtype="float32"``
+                for the 1.2.0 model. With ``vocoder="meanflow"`` and no
                 ``meanflow_path``, this call also downloads
                 ``s3gen_meanflow.safetensors`` from ``ResembleAI/chatterbox-turbo``.
 
