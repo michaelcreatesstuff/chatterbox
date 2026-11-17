@@ -12,7 +12,7 @@ Provides comprehensive audio quality checks:
 """
 
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 import librosa
 import numpy as np
 
@@ -414,13 +414,13 @@ def print_quality_report(metrics: AudioQualityMetrics, verbose: bool = True, ref
 
         # Show expected and transcribed text
         if reference_text:
-            print(f"\n  Expected text:")
+            print("\n  Expected text:")
             print(f"    {reference_text}")
-        print(f"\n  Transcript:")
+        print("\n  Transcript:")
         print(f"    {metrics.transcription}")
 
     # Audio fidelity
     if metrics.has_hard_cutoff:
-        print(f"  ⚠️  Hard cutoff detected (no fade to silence)")
+        print("  ⚠️  Hard cutoff detected (no fade to silence)")
     if metrics.trailing_silence_s > 0.5:
         print(f"  Trailing silence: {metrics.trailing_silence_s:.2f}s")

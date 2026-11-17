@@ -17,7 +17,7 @@ import psutil
 import os
 import argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 import logging
 
 import numpy as np
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Check for MLX availability
 try:
-    import mlx.core as mx
+    import mlx.core  # noqa: F401  (availability check)
     MLX_AVAILABLE = True
 except ImportError:
     MLX_AVAILABLE = False
@@ -106,15 +106,15 @@ class BenchmarkResults:
             avg_speedup_quant = np.mean([r['speedup_quant'] for r in quant_results])
             avg_mem_reduction_quant = np.mean([r['mem_reduction_quant'] for r in quant_results])
 
-            print(f"\nOverall Performance:")
-            print(f"  MLX Full Precision:")
+            print("\nOverall Performance:")
+            print("  MLX Full Precision:")
             print(f"    Average Speedup: {avg_speedup:.2f}x")
             print(f"    Average Memory Reduction: {avg_mem_reduction:.1f}%")
-            print(f"  MLX 4-bit Quantized:")
+            print("  MLX 4-bit Quantized:")
             print(f"    Average Speedup: {avg_speedup_quant:.2f}x")
             print(f"    Average Memory Reduction: {avg_mem_reduction_quant:.1f}%")
         else:
-            print(f"\nOverall Performance:")
+            print("\nOverall Performance:")
             print(f"  Average Speedup: {avg_speedup:.2f}x")
             print(f"  Average Memory Reduction: {avg_mem_reduction:.1f}%")
         print()

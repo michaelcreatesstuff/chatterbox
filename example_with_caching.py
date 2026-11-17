@@ -107,7 +107,7 @@ for i, text in enumerate(texts, 1):
     # Save the last one as example
     if i == len(texts):
         ta.save("example_cached_output.wav", wav, model.sr)
-        print(f"    Saved to: example_cached_output.wav\n")
+        print("    Saved to: example_cached_output.wav\n")
 
 with_cache_time = time.time() - start_time
 print(f"Total generation time WITH caching: {with_cache_time:.2f}s")

@@ -4,7 +4,23 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**An MLX-optimized fork of [Resemble AI's Chatterbox TTS](https://github.com/resemble-ai/chatterbox) for Apple Silicon, delivering up to 2.4x faster inference.**
+**Run open-source, voice-cloning text-to-speech on your Mac, faster than real time, with no cloud and no GPU server.**
+
+## Why this project exists
+
+[Resemble AI's Chatterbox](https://github.com/resemble-ai/chatterbox) is a high-quality open-source TTS model family. The upstream code targets NVIDIA GPUs. On a Mac, it runs on the CPU or on PyTorch MPS, which is slow, and some models fail on long text. This package ports the models to [MLX](https://github.com/ml-explore/mlx), the Apple Silicon machine-learning framework. You generate speech on your own machine, so your text and voice samples stay private.
+
+## Impact
+
+- **Generates** English speech up to 12x faster than real time with Chatterbox-Nano (RTF 0.083 on a 292-word text).
+- **Runs** Chatterbox-Turbo about 4x faster than mlx-audio on long text (RTF 0.12 against 0.53).
+- **Speeds up** Chatterbox-Flash 2.7x over the upstream MLX backend on medium text (RTF 0.37 against 0.99).
+- **Keeps** long text stable. Sentence splitting and batched chunks stop the long-text collapse of upstream Nano. WER stays at or below 0.012 on a 292-word text for Nano, Turbo and Flash.
+- **Streams** audio before the full text is done. Use `generate_stream()` on Nano, Turbo and the multilingual model. Multilingual first audio arrives in about 0.6 s with fp16 T3 and the meanflow vocoder.
+- **Supports** 23 languages and voice cloning from a short reference clip.
+- **Verifies** each change with evals. Whisper WER, committed benchmarks and reference-output tests decide what ships.
+
+All figures are from an Apple M4 (32 GB) with fp16. RTF is generation time divided by audio time, so lower is faster. The tables below give the full results.
 
 ---
 
@@ -442,6 +458,26 @@ wav = model.generate("こんにちは、元気ですか？", language_id="ja")
 ```
 
 By default, multilingual output has no watermark, the same as upstream. Set `watermark=True` in `generate()`, `generate_long()` or `generate_stream()` to add a Perth watermark. The stream watermarks each piece and keeps the piece lengths. The watermarker loads on first use, so it costs nothing when it is off.
+
+### Multilingual speed options
+
+Set these options at load time to make the multilingual model faster:
+
+```python
+model = ChatterboxMultilingualTTSMLX.from_pretrained(
+    device="mps",
+    vocoder="meanflow",  # "pt" (default), "mlx" (MLX port, 5 steps) or "meanflow" (2 steps)
+    t3_dtype="fp16",     # "float32" (default), "fp16"
+)
+
+for piece in model.generate_stream("Bonjour, comment ça va?", language_id="fr"):
+    ...  # play each 1-D float32 piece at model.sr, in order
+```
+
+- `vocoder="meanflow"` uses the Turbo meanflow S3Gen vocoder. Without `meanflow_path`, `from_pretrained()` downloads `s3gen_meanflow.safetensors` from `ResembleAI/chatterbox-turbo`.
+- `t3_dtype="fp16"` runs the T3 decoder in half precision. `quantize_bits` (`8` or `4`) also works. Listen to the output before you use quantization.
+- `generate_stream()` follows the same rules as the Turbo stream. Its default `chunk_tokens` is 40, not 50. With 50, playback gapped in some replies.
+- The fast T3 decode loop is the default. It uses a preallocated KV cache and fused attention.
 
 ---
 

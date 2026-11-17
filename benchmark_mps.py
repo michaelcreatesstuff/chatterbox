@@ -20,7 +20,6 @@ Designed for MacBook Pro M4 32GB.
 """
 
 import torch
-import torchaudio as ta
 import numpy as np
 from scipy.io import wavfile
 import psutil
@@ -29,7 +28,7 @@ import time
 import gc
 import statistics
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 from pathlib import Path
 from chatterbox.models.utils import get_memory_info
 from benchmark_audio_quality import (
@@ -389,20 +388,20 @@ class ChatterboxBenchmark:
 
         if is_hybrid_mlx:
             # Hybrid MLX: T3 MLX + S3Gen PyTorch
-            print(f"  Backend: Hybrid MLX (T3 MLX + S3Gen PyTorch)")
-            print(f"  T3: MLX (Apple Silicon optimized)")
-            print(f"  S3Gen: PyTorch on MPS")
+            print("  Backend: Hybrid MLX (T3 MLX + S3Gen PyTorch)")
+            print("  T3: MLX (Apple Silicon optimized)")
+            print("  S3Gen: PyTorch on MPS")
         elif is_mlx:
             # MLX models
-            print(f"  Backend: MLX (Apple Silicon optimized)")
+            print("  Backend: MLX (Apple Silicon optimized)")
             if device == "mlx-q4":
-                print(f"  Quantization: 4-bit (group_size=64)")
+                print("  Quantization: 4-bit (group_size=64)")
             else:
-                print(f"  Precision: Full (float32)")
+                print("  Precision: Full (float32)")
         else:
             # PyTorch models
-            print(f"  Backend: PyTorch")
-            print(f"  Float16 KV cache optimization: ENABLED")
+            print("  Backend: PyTorch")
+            print("  Float16 KV cache optimization: ENABLED")
 
             # Check device availability
             if device == "mps":
@@ -439,7 +438,7 @@ class ChatterboxBenchmark:
                     self.model = ChatterboxTTSMLX.from_pretrained()
                 log_memory_detailed("hybrid_mlx_model_loaded", device)
             except (ImportError, RuntimeError, AttributeError) as e:
-                print(f"\n⚠️  Hybrid MLX backend not available")
+                print("\n⚠️  Hybrid MLX backend not available")
                 print(f"    Error: {str(e)[:100]}")
                 raise RuntimeError(f"Hybrid MLX backend not available: {e}")
         elif is_mlx:
@@ -466,10 +465,10 @@ class ChatterboxBenchmark:
                     log_memory_detailed("mlx_q4_after_quantize", device)
                     print("  ✓ Quantization complete")
             except (ImportError, RuntimeError, AttributeError) as e:
-                print(f"\n⚠️  MLX backend not fully implemented yet")
+                print("\n⚠️  MLX backend not fully implemented yet")
                 print(f"    Error: {str(e)[:100]}")
-                print(f"    Skipping MLX benchmarks...")
-                print(f"    Note: Currently only PyTorch backends (mps, cpu) are supported")
+                print("    Skipping MLX benchmarks...")
+                print("    Note: Currently only PyTorch backends (mps, cpu) are supported")
                 raise RuntimeError(f"MLX backend not available: {e}")
         else:
             # PyTorch backend
@@ -498,7 +497,7 @@ class ChatterboxBenchmark:
         
         # Initial model warmup to trigger JIT compilation (especially important for MPS)
         # This ensures the first actual benchmark doesn't include compilation overhead
-        print(f"  Running initial warmup (JIT compilation)...", end="", flush=True)
+        print("  Running initial warmup (JIT compilation)...", end="", flush=True)
         warmup_text = "Hello, this is a warmup."
         try:
             _ = self.model.generate(warmup_text, exaggeration=0.5, cfg_weight=0.5)
@@ -526,7 +525,6 @@ class ChatterboxBenchmark:
         log_memory_detailed(f"gen_after_clear_run{run_id}", self.current_device)
 
         mem_before = get_memory_mb()
-        gpu_mem_before = get_gpu_memory_mb(self.current_device)
 
         start_time = time.time()
 
@@ -627,19 +625,19 @@ class ChatterboxBenchmark:
 
         # Indicate which generation method will be used
         if category in ["long", "extra_long"]:
-            print(f"  Method: generate_long() with chunking (50 words/chunk)")
+            print("  Method: generate_long() with chunking (50 words/chunk)")
         else:
-            print(f"  Method: generate() (single-pass)")
+            print("  Method: generate() (single-pass)")
 
         # Warmup runs
-        print(f"  Warmup runs: ", end="", flush=True)
+        print("  Warmup runs: ", end="", flush=True)
         for i in range(self.config.warmup_runs):
             self.run_single_generation(text, run_id=i, category=category)
             print(".", end="", flush=True)
         print(" done")
 
         # Benchmark runs
-        print(f"  Benchmark runs: ", end="", flush=True)
+        print("  Benchmark runs: ", end="", flush=True)
         run_results: List[SingleRunResult] = []
         for i in range(self.config.benchmark_runs):
             # Keep the waveform from the last timed run if we want to save audio
@@ -713,7 +711,7 @@ class ChatterboxBenchmark:
 
                 # Comprehensive audio quality validation
                 if self.config.validate_transcription:
-                    print(f"  Validating audio quality...")
+                    print("  Validating audio quality...")
                     quality_metrics = validate_audio_quality(
                         audio_path=str(output_path),
                         reference_text=text,
@@ -739,7 +737,7 @@ class ChatterboxBenchmark:
         print("\n" + "="*70)
         print("CHATTERBOX TTS BENCHMARK")
         print("="*70)
-        print(f"Platform: macOS with Apple Silicon")
+        print("Platform: macOS with Apple Silicon")
         print(f"MPS Available: {torch.backends.mps.is_available()}")
         print(f"PyTorch Version: {torch.__version__}")
         print(f"Model Type: {self.config.model_type}")
@@ -747,10 +745,10 @@ class ChatterboxBenchmark:
         print(f"Benchmark Runs: {self.config.benchmark_runs}")
         print(f"Devices to Test: {', '.join(self.config.test_devices)}")
         if self.config.validate_transcription:
-            print(f"Transcription Validation: ENABLED (MLX Whisper)")
-        print(f"\n✓ Float16 KV Cache: ENABLED (default)")
-        print(f"  - Expected: 18-32% faster generation")
-        print(f"  - Expected: Significant memory savings")
+            print("Transcription Validation: ENABLED (MLX Whisper)")
+        print("\n✓ Float16 KV Cache: ENABLED (default)")
+        print("  - Expected: 18-32% faster generation")
+        print("  - Expected: Significant memory savings")
         print("="*70)
         
         all_tests = [
